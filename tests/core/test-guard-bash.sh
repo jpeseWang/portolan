@@ -250,6 +250,28 @@ SDW_RELAX=0 run "$WS/web" "" 'gh pr merge 12 --squash'
 printf '%s' "$OUT" | grep -q '"permissionDecision":"ask"' || fail "SDW_RELAX=0 should still ask" "exit $RC out '$OUT'"
 ok "SDW_RELAX=0 asks"
 
+# The same switch as a file, for sessions that are already running (their environment cannot change).
+GH_MERGE='gh pr merge 12 --squash'
+RELAX_DIR="$HOME/.config/sdw"; mkdir -p "$RELAX_DIR"
+asks "$GH_MERGE"
+: > "$RELAX_DIR/relax"
+allow "$GH_MERGE"
+SDW_RELAX=0 asks "$GH_MERGE"
+for c in 'rm -rf /' 'git reset --hard'; do deny "$c"; done
+asks 'git push origin main'
+ok "relax file: soft asks silent, SDW_RELAX=0 wins, denies and base-branch push unchanged"
+rm "$RELAX_DIR/relax"; mkdir "$RELAX_DIR/relax"
+asks "$GH_MERGE"
+rmdir "$RELAX_DIR/relax"
+ok "a directory named relax does not count"
+mkdir -p "$tmp/cfg"; : > "$tmp/cfg/relax"
+SDW_CONFIG_DIR="$tmp/cfg" allow "$GH_MERGE"
+asks "$GH_MERGE"
+ok "SDW_CONFIG_DIR points at another folder, and only then"
+mkdir -p "$tmp/xdg/sdw"; : > "$tmp/xdg/sdw/relax"
+XDG_CONFIG_HOME="$tmp/xdg" allow "$GH_MERGE"
+ok "XDG_CONFIG_HOME is honoured"
+
 # --- ask mode switch
 SDW_ASK_MODE=deny run "$WS/web" "" 'psql -c "truncate table audit"'
 [ "$RC" = 2 ] || fail "SDW_ASK_MODE=deny" "exit $RC"; ok "SDW_ASK_MODE=deny turns ask into exit 2"

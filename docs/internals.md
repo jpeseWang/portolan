@@ -803,10 +803,13 @@ DENY (exit 2, stderr `sdw: blocked — <reason>; <safer alternative>`):
 ASK (`SDW_ASK_MODE=json`: stdout
 `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"sdw: <reason>"}}`, exit 0):
 
-Soft asks, marked **(soft)** below, ask by default. `SDW_RELAX=1` in the environment of the session turns
-exactly these off, for unattended runs where a confirmation stalls the work; set it in your shell profile or in
-Claude Code's settings under `env`. Every DENY and every unmarked ASK stays on either way. `relaxed()` in
-guard-bash.sh implements it; `tests/core/test-guard-bash.sh` checks each soft case in both modes (`relaxed`).
+Soft asks, marked **(soft)** below, ask by default. Two switches turn exactly these off, for unattended runs where
+a confirmation stalls the work: `SDW_RELAX=1` in the environment of the session, or, when `SDW_RELAX` is unset, a
+file `~/.config/sdw/relax` (`mkdir -p ~/.config/sdw && touch ~/.config/sdw/relax`; `SDW_CONFIG_DIR` or
+`XDG_CONFIG_HOME` move the folder). The file also reaches sessions that are already running, whose environment
+cannot change, and sessions started from an app that does not read your shell profile. `SDW_RELAX=0` forces the ask
+whatever the file says. Every DENY and every unmarked ASK stays on either way. `relaxed()` in guard-bash.sh
+implements it; `tests/core/test-guard-bash.sh` checks each soft case in both modes (`relaxed`) and the file.
 - **(soft)** force push not covered above (`--force-with-lease` to a non-base branch is allowed silently)
 - any other push to a base branch, whatever the form (`git -C <dir>`, `/usr/bin/git`, wrappers,
   nested shells): a refspec whose destination is `<base>`, `HEAD:<base>`, `refs/heads/<base>` or

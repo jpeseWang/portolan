@@ -111,7 +111,7 @@ tests/run.sh route      # only route
 - No keys are stored in this repo. route reads API keys from the macOS Keychain or the environment and passes them to
   child processes through the environment or stdin, not on a command line.
 - sdw's guard hooks ask before force pushes, PR merges, container removal and similar. `SDW_RELAX=1` in your
-  environment switches the softer asks off; see docs/internals.md. Hard denials (`rm -rf` outside the project, reading
+  environment, or a file `~/.config/sdw/relax`, switches the softer asks off; see docs/internals.md. Hard denials (`rm -rf` outside the project, reading
   secrets, and so on) stay on either way.
 - `AIM_AGY_AUTOAPPROVE=1` in `route/local.zsh` makes the `agy` wrapper skip Antigravity's permission prompts. It is off by default.
 - Which code may be sent to which provider is your or your client's decision. route enforces nothing beyond the

@@ -25,8 +25,18 @@ HOME_P=$(cd "$HOME" 2>/dev/null && pwd -P) || HOME_P=$HOME
 
 deny() { echo "sdw: blocked — $1; $2" >&2; exit 2; }
 ask() { [ -n "$ASK_REASON" ] || ASK_REASON=$1; }
-# A soft ask: asks like ask(), but stays silent when SDW_RELAX=1 (unattended runs). Never used for a deny.
-relaxed() { [ "${SDW_RELAX:-0}" = 1 ] || ask "$1"; }
+# A soft ask: asks like ask(), but stays silent for unattended runs. Never used for a deny.
+# On when SDW_RELAX=1, or, when SDW_RELAX is unset, when the file <config dir>/relax exists (default
+# ~/.config/sdw; SDW_CONFIG_DIR or XDG_CONFIG_HOME move it). The file reaches sessions already running,
+# whose environment cannot change. SDW_RELAX=0 forces the ask whatever the file says.
+relaxed() {
+  case "${SDW_RELAX:-}" in
+    1) return 0 ;;
+    0) ask "$1"; return 0 ;;
+  esac
+  [ -f "${SDW_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sdw}/relax" ] || ask "$1"
+  return 0
+}
 
 CONF=0 SDWAG=0
 case "$AGENT" in sdw:qa|sdw:reviewer) CONF=1 ;; esac
