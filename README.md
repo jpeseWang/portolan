@@ -48,8 +48,8 @@ Part B, only if I use Claude Code and say yes: the sdw workflow plugin, from the
    show me the output, including the settings diff it would apply to my Claude Code settings. If I use more than one
    Claude config directory, ask me which one first, because bootstrap follows CLAUDE_CONFIG_DIR.
 8. Only after I say yes, run ./bootstrap.sh with no other option. Never run --uninstall, --update or --migrate, and
-   add --with-qa-tools or --security-skill only if I ask. Afterwards tell me to run /reload-plugins in Claude Code and
-   /sdw:onboard inside a project; do not onboard a project for me.
+   add --with-qa-tools or --security-skill only if I ask. Afterwards tell me to run /reload-plugins in Claude Code, and that /sdw:onboard is a
+   separate step I run once per project when I start working in one; do not onboard a project for me.
 
 Rules:
 - Never read, print or ask me for API keys, tokens or passwords. Do not open any CLI's credential or auth files, or
@@ -64,22 +64,34 @@ Rules:
 
 ## Set it up yourself
 
+Two levels. Each works without the other, and **neither needs onboarding to install**.
+
+**1. route**: pick the right tool by remaining quota (any of the three tools, about a minute).
+
 ```
 git clone https://github.com/jpeseWang/portolan ~/portolan
 cd ~/portolan
-
-./route/setup.sh --dry-run     # route: shows every change, makes none
+./route/setup.sh --dry-run     # shows every change, makes none
 ./route/setup.sh               # creates route/local.zsh and route/state/, runs the tests
-
-./bootstrap.sh --dry-run       # sdw (Claude Code only): shows the settings diff, makes no change
-./bootstrap.sh
 ```
+
+Then, in a new terminal: `ai-quota --subs` and `aim-pick qa-run`. That is all route needs.
+
+**2. sdw**: add it when you want gates, independent QA and review in your repos (Claude Code only).
+
+```
+./bootstrap.sh --dry-run       # shows the settings diff, makes no change
+./bootstrap.sh                 # once per machine; then /reload-plugins in open Claude Code sessions
+```
+
+`/sdw:onboard` is a different step: you run it **once per project**, the first time you start working in that
+project (it runs the stack, records a test baseline and derives the gates). Installing does not need it and route
+never does; a project you have not onboarded still gets sdw's core rules, just not its project gates.
 
 sdw alone, without bootstrap's settings merge: in Claude Code, `/plugin install sdw --marketplace jpeseWang/portolan`.
 That installs the plugin only (no settings, no verify skill); `./bootstrap.sh` is the path this repo tests.
 
-Then, in a new terminal: `ai-quota --subs` and `aim-pick qa-run`. Details, options and what each command changes:
-[route/README.md](route/README.md) and [docs/sdw.md](docs/sdw.md).
+Details, options and what each command changes: [route/README.md](route/README.md) and [docs/sdw.md](docs/sdw.md).
 
 ## Using the two together
 
