@@ -12,7 +12,7 @@ mkdir -p "$HOME" "$tmp/stub" "$TMPDIR"
 export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=sdw-test GIT_AUTHOR_EMAIL=sdw-test@example.invalid
 export GIT_COMMITTER_NAME=sdw-test GIT_COMMITTER_EMAIL=sdw-test@example.invalid
 export CLAUDE_PLUGIN_ROOT="$PLUGIN"
-unset CLAUDE_PROJECT_DIR CLAUDE_ENV_FILE SDW_ASK_MODE SDW_STOP_MODE SDW_WD SDW_GATE_TIMEOUT SDW_RELAX
+unset CLAUDE_PROJECT_DIR CLAUDE_ENV_FILE SDW_ASK_MODE SDW_STOP_MODE SDW_WD SDW_GATE_TIMEOUT SDW_RELAX SDW_CONFIG_DIR XDG_CONFIG_HOME
 for s in security curl gh claude npx node; do
   printf '#!/bin/sh\nexit 0\n' > "$tmp/stub/$s"
   chmod +x "$tmp/stub/$s"
