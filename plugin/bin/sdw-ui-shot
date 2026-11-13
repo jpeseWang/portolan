@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Exit: 0 captured, 1 navigation failed (JSON still printed), 2 usage, 3 not onboarded (--role,
+# --save-auth), 4 no node>=18, Playwright, browser or storage file.
+set -u
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+usage() {
+  cat <<'EOF'
+usage: sdw-ui-shot --url U --out F.png [--viewport WxH] [--dpr N] [--wait SEL] [--networkidle]
+         [--settle MS] [--full-page] [--storage FILE | --role R] [--measure SEL]...
+         [--color-scheme light|dark] [--channel chrome] [--headed] [--axe]
+         [--motion SEL]... [--reduced-motion reduce|no-preference] [--vitals]
+         [--timezone IANA_ID] [--locale LL-CC] [--click SEL]... [--fill SEL=VALUE]...
+         [--route 'GLOB=<status>|<status>:@body.json|offline|empty|delay:MS']...
+       sdw-ui-shot --save-auth R --url LOGIN_URL --headed
+
+Captures one page and prints JSON: url, out, viewport, status, timezone, locale, steps,
+mocked (number of --route mocks), console[], pageerror[], requests[] (failed and >=400),
+reducedMotion, measure{}, motion{} (transition and animation styles per --motion SEL),
+vitals (null unless --vitals: cls, shifts, lcpMs, longTasks, inpMs from --click/--fill),
+axe (null unless --axe), error.
+Captures emulate prefers-reduced-motion: reduce unless --reduced-motion no-preference.
+--click/--fill run in order after load (and --wait), so a mocked submit error can be captured.
+Playwright comes from the app's node_modules ($PWD up), else playwright-cli, else a pinned
+copy in ~/.cache/sdw (SDW_OFFLINE=1 forbids the install). --role R reads .sdw/auth/R.json
+and/or .sdw/auth/R.header (sent as extra HTTP headers).
+--save-auth opens a headed browser; log in, close the window, R.json is written.
+EOF
+}
+
+need_projdir=0
+for a in "$@"; do
+  case "$a" in
+    -h|--help) usage; exit 0 ;;
+    --role|--save-auth) need_projdir=1 ;;
+  esac
+done
+
+if ! command -v node >/dev/null 2>&1 \
+  || ! node -e 'process.exit(+process.versions.node.split(".")[0] >= 18 ? 0 : 1)' 2>/dev/null; then
+  echo "sdw-ui-shot: node >= 18 required on PATH" >&2
+  exit 4
+fi
+
+if [ "$need_projdir" = 1 ]; then
+  pd=$("$here/sdw-workdir" --projdir 2>/dev/null)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$pd" ]; then
+    echo "sdw-ui-shot: not onboarded (run /sdw:onboard)" >&2
+    exit 3
+  fi
+  export SDW_PROJDIR="$pd"
+fi
+
+exec node "$here/../libexec/ui-shot.mjs" "$@"

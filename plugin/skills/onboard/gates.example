@@ -1,0 +1,27 @@
+# .sdw/gates — read by sdw-gate, the Stop hook, /sdw:commit and /sdw:ship.
+# <repo>:<prefix> | fast: <cmd> | full: <cmd>
+#   repo = main checkout basename; prefix = repo-relative dir, or "." for the whole repo.
+#   Commands run with cwd <checkout>/<prefix> after .sdw/env.sh. A changed path selects every line
+#   whose prefix it is under. Docs (.md .mdx .txt, docs/, local-docs/) never select a gate.
+# deps: <repo>:<prefix> -> <repo>:<prefix> …   (one level: a change under the left also runs the right)
+# fast ≤ ~60 s, no build output a running dev server uses. full = every CI step that runs locally.
+# Every line below is an example; keep only lines you ran green on a clean base.
+
+# Single app at the repo root
+# shop:. | fast: npx tsc --noEmit && npx eslint . | full: npm run lint && npm test && npm run build
+
+# Monorepo with apps and a shared package
+# shop:apps/web | fast: pnpm exec tsc --noEmit && pnpm exec eslint . | full: pnpm run check
+# shop:apps/api | fast: pnpm exec tsc --noEmit | full: pnpm test && pnpm exec prisma migrate diff --exit-code --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "$SHADOW_DATABASE_URL"
+# deps: shop:packages/shared -> shop:apps/web shop:apps/api
+
+# Turbo or Nx: one affected line instead of per-app lines
+# shop:. | fast: npx turbo run typecheck lint --filter=...[HEAD] | full: npx turbo run check test build --filter=...[origin/main]
+# shop:. | fast: npx nx affected -t lint,typecheck --base=HEAD | full: npx nx affected -t lint,test,build --base=origin/main
+
+# Non-git workspace parent holding several repos (repo = folder name)
+# platform:Admin.Frontend | fast: npm run typecheck && npm run lint | full: npm run check
+# platform:Api | fast: dotnet build Api.csproj --no-restore -o "$TMPDIR/sdw-build" | full: dotnet csharpier --check . && dotnet test ../Api.Tests && dotnet ef migrations has-pending-model-changes
+
+# Codegen drift as a full-gate step
+# shop:apps/web | full: npm run generate:api && git diff --exit-code src/api

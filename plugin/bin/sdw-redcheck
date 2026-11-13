@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# Proves a new or changed test fails on the base commit, or on HEAD with the new code broken, for the right reason.
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-redcheck <base> --test <file> [--test <file>]... [--app <dir>] -- <cmd> [args...]
+       sdw-redcheck --mutate <patch> --test <file>... [--app <dir>] -- <cmd> [args...]
+
+Copies the test files into a throwaway worktree of <base>, runs <cmd> there with
+SDW_REDCHECK=1, classifies the result and records evidence kind `redcheck`.
+--mutate: the worktree is HEAD plus the working tree's changes, with <patch> applied; the
+patch may touch only non-test code. A RED(assertion) there is RED(mutation).
+<file> is relative to $PWD or to the repo root. --app is repo-relative (default: $PWD).
+Last line: RESULT: RED(assertion)|RED(mutation)|RED(build/import)|RED(setup)|RED(unknown)|GREEN
+Exit 0 RED(assertion) or RED(mutation), 1 any other result, 2 usage, 4 setup failed or the
+patch does not apply, 5 refused.
+Env: SDW_REDCHECK_TIMEOUT seconds (default 600).
+EOF
+}
+
+say() { printf 'sdw-redcheck: %s\n' "$*" >&2; }
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+mode=base
+case "$1" in -h|--help) usage; exit 0 ;; --mutate) base=HEAD mode=mutate ;; -*) usage >&2; exit 2 ;; *) base=$1; shift ;; esac
+tests=(); app=""; patch=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mutate) [ $# -ge 2 ] && [ -z "$patch" ] || { usage >&2; exit 2; }; patch=$2; shift 2 ;;
+    --test) [ $# -ge 2 ] || { usage >&2; exit 2; }; tests+=("$2"); shift 2 ;;
+    --app) [ $# -ge 2 ] || { usage >&2; exit 2; }; app=$2; shift 2 ;;
+    --) shift; break ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[ ${#tests[@]} -gt 0 ] && [ $# -gt 0 ] || { usage >&2; exit 2; }
+[ -z "$patch" ] || [ "$mode" = mutate ] || { usage >&2; exit 2; }
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { say "not inside a git work tree"; exit 4; }
+top=$(cd "$top" && pwd -P)
+cwd=$(pwd -P)
+git rev-parse --verify -q "$base^{commit}" >/dev/null || { say "unknown base: $base"; exit 4; }
+if [ -n "$patch" ]; then
+  [ -f "$patch" ] || { say "patch not found: $patch"; exit 4; }
+  patch="$(cd "$(dirname "$patch")" && pwd -P)/$(basename "$patch")"
+fi
+
+rel=()
+for t in "${tests[@]}"; do
+  if [ -f "$t" ]; then
+    abs="$(cd "$(dirname "$t")" && pwd -P)/$(basename "$t")"
+  elif [ -f "$top/$t" ]; then
+    abs="$top/$t"
+  else
+    say "test file not found: $t"; exit 4
+  fi
+  case "$abs" in "$top"/*) rel+=("${abs#"$top"/}") ;; *) say "outside the repo: $t"; exit 2 ;; esac
+done
+
+if [ -z "$app" ]; then
+  case "$cwd" in "$top") app="." ;; "$top"/*) app="${cwd#"$top"/}" ;; *) app="." ;; esac
+fi
+app=${app%/}; [ -n "$app" ] || app="."
+
+projdir=$("$here/sdw-workdir" --projdir 2>/dev/null) || projdir=""
+
+# DB-touching tests need an isolated test DB declared in run.md.
+test_db() {
+  local runmd="$projdir/.sdw/run.md"
+  [ -n "$projdir" ] && [ -f "$runmd" ] || return 0
+  local repo; repo=$(basename "$(cd "$top" && cd "$(git rev-parse --git-common-dir)" && cd .. && pwd -P)")
+  awk -v repo="$repo" -v app="$app" '
+    /^## /     { sec = ($0 ~ /^## app/); p = ""; next }
+    sec && /^- path:/ { sub(/^- path:[ \t]*/, ""); p = $0; next }
+    sec && /^- test-db:/ { v = $0; sub(/^- test-db:[ \t]*/, "", v); n++; any = v
+      split(p, kv, ":"); pre = kv[2]
+      if (kv[1] == repo && (pre == "." || app == pre || index(app, pre "/") == 1) && length(pre) >= best) { best = length(pre); hit = v } }
+    END { if (hit != "") print hit; else if (n == 1) print any }
+  ' "$runmd"
+}
+db_re='DbContext|DATABASE_URL|prisma|typeorm|knex|sequelize|mongoose|SqlConnection|WebApplicationFactory'
+touches_db=0
+for r in "${rel[@]}"; do grep -Eq "$db_re" "$top/$r" && touches_db=1; done
+
+# A mutation breaks the code under test, never a test.
+if [ -n "$patch" ]; then
+  (cd "$top" && git apply --numstat "$patch" >/dev/null 2>&1) || { say "patch does not parse: $patch"; exit 4; }
+  grep -Eq '^(rename|copy) (from|to) ' "$patch" && { say "refused: the patch renames or copies a file"; exit 5; }
+  tab=$(printf '\t') pp=""
+  while IFS= read -r -d '' f; do
+    f=${f#*"$tab"}; f=${f#*"$tab"}
+    [ -n "$f" ] || { say "refused: the patch renames or copies a file"; exit 5; }
+    case "$f" in *'
+'*) say "refused: the patch names a path with a newline"; exit 5 ;; esac
+    pp="$pp$f
+"
+  done < <(cd "$top" && git apply --numstat -z "$patch" 2>/dev/null)
+  pp=${pp%?}
+  [ -n "$pp" ] || { say "patch does not parse: $patch"; exit 4; }
+  hit=$(printf '%s\n' "$pp" | "$here/sdw-tamper" --test-paths) || { say "sdw-tamper failed"; exit 4; }
+  [ -z "$hit" ] || { say "refused: the patch touches test paths: $(printf '%s' "$hit" | tr '\n' ' ')"; exit 5; }
+  while IFS= read -r f; do
+    case "$f" in .sdw/*) say "refused: the patch touches $f"; exit 5 ;; esac
+    for r in "${rel[@]}"; do [ "$f" = "$r" ] && { say "refused: the patch touches the test $f"; exit 5; }; done
+  done <<EOF
+$pp
+EOF
+fi
+printf '%s\n' "$*" | grep -Eq "$db_re" && touches_db=1
+if [ "$touches_db" = 1 ]; then
+  db=$(test_db | tr -d '[:space:]')
+  case "$db" in
+    ""|none) say "refused: test touches a database and run.md test-db is ${db:-missing}"; exit 5 ;;
+  esac
+fi
+
+slug="red-$(date +%s)-$$"
+wt=""
+log=$(mktemp "${TMPDIR:-/tmp}/sdw-redcheck.XXXXXX")
+cleanup() {
+  [ -n "$wt" ] && (cd "$top" && "$here/sdw-wt" rm "$slug" --force >/dev/null 2>&1 || say "could not remove $wt")
+  rm -f "$log"
+}
+trap cleanup EXIT
+
+wt=$(cd "$top" && "$here/sdw-wt" add "$slug" --detach "$base" --no-deps 2>"$log" | tail -n 1)
+if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+  say "sdw-wt add failed: $(tail -n 5 "$log")"; wt=""; exit 4
+fi
+[ -d "$wt/$app" ] || { say "app dir missing on $base: $app"; exit 4; }
+if [ -n "$patch" ]; then
+  while IFS= read -r -d '' f; do
+    if [ -f "$top/$f" ] || [ -L "$top/$f" ]; then
+      mkdir -p "$wt/$(dirname "$f")" && cp -pP "$top/$f" "$wt/$f" || { say "copy failed: $f"; exit 4; }
+    elif [ ! -e "$top/$f" ]; then
+      rm -f "$wt/$f"
+    fi
+  done < <(cd "$top" && git diff -z --name-only HEAD && git ls-files -z --others --exclude-standard)
+  (cd "$wt" && git apply "$patch") >"$log" 2>&1 || { say "patch does not apply: $(tail -n 3 "$log")"; exit 4; }
+fi
+for r in "${rel[@]}"; do
+  mkdir -p "$wt/$(dirname "$r")" && cp -p "$top/$r" "$wt/$r" || { say "copy failed: $r"; exit 4; }
+done
+
+[ -n "$projdir" ] && [ -f "$projdir/.sdw/env.sh" ] && . "$projdir/.sdw/env.sh"
+
+# Workspace installs link packages to their checkout, so a symlinked node_modules would test this branch's code.
+install_deps() {
+  local d
+  if [ -f "$wt/pnpm-workspace.yaml" ]; then
+    (cd "$wt" && pnpm install --offline --frozen-lockfile) || return 1
+  elif [ -f "$wt/package.json" ] && grep -q '"workspaces"' "$wt/package.json"; then
+    if [ -f "$wt/yarn.lock" ]; then (cd "$wt" && yarn install --frozen-lockfile --offline) || return 1
+    else (cd "$wt" && npm ci --prefer-offline --no-audit --no-fund) || return 1; fi
+  else
+    for d in . "$app"; do
+      for m in node_modules .venv venv; do
+        [ -e "$top/$d/$m" ] && [ ! -e "$wt/$d/$m" ] && ln -s "$top/$d/$m" "$wt/$d/$m"
+      done
+    done
+  fi
+  if ls "$wt/$app"/*.csproj "$wt/$app"/*.sln >/dev/null 2>&1; then
+    (cd "$wt/$app" && dotnet restore) || return 1
+  fi
+  return 0
+}
+install_deps >>"$log" 2>&1 || { say "dependency install failed: $(tail -n 5 "$log")"; exit 4; }
+
+: >"$log"
+(cd "$wt/$app" && SDW_REDCHECK=1 perl -e 'alarm shift; exec @ARGV' "${SDW_REDCHECK_TIMEOUT:-600}" "$@") >"$log" 2>&1
+rc=$?
+
+if [ "$rc" = 0 ]; then
+  class="GREEN"
+elif [ "$rc" = 142 ]; then
+  class="RED(unknown)"; say "timed out after ${SDW_REDCHECK_TIMEOUT:-600}s"
+elif grep -Eq 'TS2307|TS2305|CS0246|CS0103|CS1061|Cannot find module|ModuleNotFoundError|ImportError|SyntaxError|Build FAILED' "$log"; then
+  class="RED(build/import)"
+elif grep -Eq 'ECONNREFUSED|EADDRINUSE|beforeAll.*[Tt]imeout|Cannot (GET|POST|PUT|DELETE) /' "$log"; then
+  class="RED(setup)"
+elif grep -Eq 'AssertionError|expect\(|Expected|Assert\.|assert ' "$log"; then
+  class="RED(assertion)"
+else
+  class="RED(unknown)"
+fi
+[ -n "$patch" ] && [ "$class" = "RED(assertion)" ] && class="RED(mutation)"
+
+tail -n 40 "$log"
+paths=()
+for r in "${rel[@]}"; do paths+=(--path "$r"); done
+if [ -n "$patch" ]; then
+  detail="mutation $(git rev-parse --short HEAD) exit $rc: $(printf '%s' "$pp" | tr '\n' ' '): $(grep -E '^[-+][^-+]' "$patch" | head -n 4 | tr '\n\t' '  ' | sed 's/ *$//')"
+else
+  detail="base $(git rev-parse --short "$base^{commit}") exit $rc: $*"
+fi
+(cd "$cwd" && "$here/sdw-evidence" add --kind redcheck --key "${rel[0]}" --result "$class" \
+  "${paths[@]}" --detail "${detail:0:200}") >/dev/null 2>&1 || say "evidence not recorded (not onboarded?)"
+echo "RESULT: $class"
+[ "$class" = "RED(assertion)" ] || [ "$class" = "RED(mutation)" ]

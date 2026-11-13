@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Project dir, repos, per-branch work dir and QA phase, all resolved from $PWD.
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-workdir [--no-create]          print <projdir>/.sdw/work/<branch slug> (created)
+       sdw-workdir --projdir              print the project dir (nearest ancestor of the main checkout with .sdw/)
+       sdw-workdir --repos                print the main checkouts under the project dir, one per line
+       sdw-workdir --branch               print the branch slug ("/" -> "__", detached-<sha7>)
+       sdw-workdir --phase [design|execute|done]   print or set the QA phase of this branch
+                                  (setting it also marks this work dir as the one under QA)
+exit: 0 ok, 2 usage, 3 not onboarded, 4 ambiguous repo
+EOF
+}
+
+die() { echo "$1" >&2; exit "$2"; }
+
+phys() { (cd "$1" 2>/dev/null && pwd -P); }
+
+HOME_P=$(phys "${HOME:-/}" || printf '%s' "${HOME:-/}")
+
+walk_up() {
+  local d=$1
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$HOME_P" ]; do
+    if [ -d "$d/.sdw" ]; then printf '%s\n' "$d"; return 0; fi
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+# Main checkout of the repo containing $1, or nothing when $1 is not in a work tree.
+main_checkout() {
+  local top common
+  top=$(cd "$1" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$top" ] || return 1
+  common=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || return 1
+  if [ "$(basename "$common")" = ".git" ]; then dirname "$common"; else phys "$top"; fi
+}
+
+projdir() {
+  local here main
+  here=$(pwd -P)
+  if main=$(main_checkout "$here"); then
+    walk_up "$main" && return 0
+  else
+    walk_up "$here" && return 0
+  fi
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "${CLAUDE_PROJECT_DIR}/.sdw" ]; then
+    phys "$CLAUDE_PROJECT_DIR"; return 0
+  fi
+  return 1
+}
+
+repos() {
+  local p=$1 g top
+  {
+    top=$(cd "$p" && git rev-parse --show-toplevel 2>/dev/null) && [ "$(phys "$top")" = "$p" ] && printf '%s\n' "$p"
+    for g in "$p"/*/.git "$p"/*/*/.git; do
+      [ -d "$g" ] || continue
+      case "$g" in */node_modules/*) continue ;; esac
+      phys "$(dirname "$g")"
+    done
+  } | LC_ALL=C sort -u
+}
+
+branch_of() {
+  local b sha
+  b=$(cd "$1" && git symbolic-ref --short -q HEAD 2>/dev/null)
+  if [ -z "$b" ]; then
+    sha=$(cd "$1" && git rev-parse --short=7 HEAD 2>/dev/null) || sha=unknown
+    b="detached-$sha"
+  fi
+  printf '%s\n' "$b" | sed 's#/#__#g'
+}
+
+bslug() {
+  local here list n
+  here=$(pwd -P)
+  if (cd "$here" && git rev-parse --is-inside-work-tree >/dev/null 2>&1); then
+    branch_of "$here"; return 0
+  fi
+  list=$(repos "$1")
+  n=$(printf '%s\n' "$list" | grep -c . || true)
+  if [ "$n" = 1 ]; then
+    n=$(cd "$list" && git worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+    [ "${n:-1}" -le 1 ] || die "sdw: ambiguous checkout: $(basename "$list") has $((n - 1)) linked worktree(s), cd into the one you mean" 4
+    branch_of "$list"; return 0
+  fi
+  die "sdw: ambiguous repo, cd into a repo or worktree" 4
+}
+
+MODE=work CREATE=1 PHASE_SET=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --no-create) CREATE=0 ;;
+    --projdir) MODE=projdir ;;
+    --repos) MODE=repos ;;
+    --branch) MODE=branch ;;
+    --phase)
+      MODE=phase
+      if [ $# -gt 1 ]; then
+        case "$2" in
+          design|execute|done) PHASE_SET=$2; shift ;;
+          *) usage >&2; exit 2 ;;
+        esac
+      fi ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+P=$(projdir) || die "sdw: not onboarded (run /sdw:onboard)" 3
+
+case "$MODE" in
+  projdir) printf '%s\n' "$P" ;;
+  repos) repos "$P" ;;
+  branch) bslug "$P" ;;
+  work|phase)
+    B=$(bslug "$P") || exit $?
+    W="$P/.sdw/work/$B"
+    if [ "$MODE" = work ]; then
+      [ "$CREATE" = 1 ] && mkdir -p "$W"
+      printf '%s\n' "$W"
+    elif [ -n "$PHASE_SET" ]; then
+      mkdir -p "$W" "$P/.sdw/state" && printf '%s\n' "$PHASE_SET" > "$W/.qa-phase" &&
+        printf '%s\n' "$B" > "$P/.sdw/state/qa-active"
+    elif [ -f "$W/.qa-phase" ]; then
+      head -n 1 "$W/.qa-phase"
+    else
+      echo none
+    fi ;;
+esac

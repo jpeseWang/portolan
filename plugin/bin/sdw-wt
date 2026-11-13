@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Sibling and throwaway worktrees. Removal only of registered, non-main worktrees (git 2.15: no "worktree remove").
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-wt add <slug> [--branch NAME] [--base REF] [--no-deps]   sibling ../<repo>-<slug>
+       sdw-wt add <slug> --detach <ref> [--no-deps]                 throwaway $TMPDIR/sdw/<repo>-<slug>
+       sdw-wt rm <slug> [--force]
+       sdw-wt list
+exit: 0 ok, 2 usage, 4 not in a repo / git failed, 5 refused (unregistered, main, or dirty without --force)
+EOF
+}
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+die() { echo "sdw-wt: $1" >&2; exit "$2"; }
+
+CMD=${1:-}
+case "$CMD" in
+  -h|--help) usage; exit 0 ;;
+  add|rm) [ $# -ge 2 ] || { usage >&2; exit 2; }; SLUG=$2; shift 2 ;;
+  list) shift ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+BRANCH="" BASE="" DETACH="" DEPS=1 FORCE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --branch) [ $# -gt 1 ] || { usage >&2; exit 2; }; BRANCH=$2; shift ;;
+    --base) [ $# -gt 1 ] || { usage >&2; exit 2; }; BASE=$2; shift ;;
+    --detach) [ $# -gt 1 ] || { usage >&2; exit 2; }; DETACH=$2; shift ;;
+    --no-deps) DEPS=0 ;;
+    --force) FORCE=1 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ "$CMD" != list ]; then
+  case "$SLUG" in ''|*/*|.*) die "bad slug: $SLUG" 2 ;; esac
+fi
+
+P=$("$here/sdw-workdir" --projdir 2>/dev/null) || P=""
+REG=""
+[ -n "$P" ] && REG="$P/.sdw/state/worktrees"
+TAB=$(printf '\t')
+TMPROOT="${TMPDIR:-/tmp}"; TMPROOT="${TMPROOT%/}/sdw"
+TMPREAL=$(cd "$TMPROOT" 2>/dev/null && pwd -P) || TMPREAL=""
+in_tmproot() {
+  case "$1" in "$TMPROOT"/*) return 0 ;; esac
+  [ -n "$TMPREAL" ] || return 1
+  case "$1" in "$TMPREAL"/*) return 0 ;; esac
+  return 1
+}
+
+if [ "$CMD" = list ]; then
+  [ -n "$REG" ] && [ -f "$REG" ] || exit 0
+  while IFS="$TAB" read -r slug repo path br iso; do
+    [ -n "$slug" ] || continue
+    flag=""
+    [ -d "$path" ] || flag=" missing"
+    printf '%s\t%s\t%s\t%s\t%s%s\n' "$slug" "$repo" "$path" "$br" "$iso" "$flag"
+  done < "$REG"
+  exit 0
+fi
+
+# Main checkout of the repo we act on: $PWD's, else the only repo under projdir.
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$top" ] && [ -n "$P" ]; then
+  list=$("$here/sdw-workdir" --repos)
+  [ "$(printf '%s\n' "$list" | grep -c .)" = 1 ] && top=$list
+fi
+[ -n "$top" ] || die "not in a git repo (cd into the repo first)" 4
+MAIN=$(cd "$top" && cd "$(git rev-parse --git-common-dir)" && pwd -P) || die "cannot find the git dir" 4
+if [ "$(basename "$MAIN")" = .git ]; then MAIN=$(dirname "$MAIN"); else MAIN=$(cd "$top" && pwd -P); fi
+REPO=$(basename "$MAIN")
+g() { (cd "$MAIN" && git "$@"); }
+
+registered() {
+  g worktree list --porcelain | sed -n 's/^worktree //p'
+}
+
+is_registered() {
+  local w want
+  want=$(cd "$1" 2>/dev/null && pwd -P) || want=$1
+  while IFS= read -r w; do
+    [ "$w" = "$1" ] || [ "$w" = "$want" ] || [ "$(cd "$w" 2>/dev/null && pwd -P)" = "$want" ] && return 0
+  done <<EOF
+$(registered | sed 1d)
+EOF
+  return 1
+}
+
+reg_drop() {
+  [ -n "$REG" ] && [ -f "$REG" ] || return 0
+  awk -F'\t' -v p="$1" '$3 != p' "$REG" > "$REG.tmp" && mv "$REG.tmp" "$REG"
+}
+
+reg_path() {
+  [ -n "$REG" ] && [ -f "$REG" ] || return 1
+  awk -F'\t' -v s="$1" -v r="$REPO" '$1 == s && $2 == r { p = $3 } END { if (p == "") exit 1; print p }' "$REG"
+}
+
+remove_path() {
+  rm -rf -- "$1"
+  g worktree prune
+  reg_drop "$1"
+}
+
+if [ "$CMD" = rm ]; then
+  path=$(reg_path "$SLUG") || path=""
+  if [ -z "$path" ]; then
+    [ -z "$P" ] || die "$SLUG is not in .sdw/state/worktrees; refusing" 5
+    path="$TMPROOT/$REPO-$SLUG"
+    [ -d "$path" ] && path=$(cd "$path" && pwd -P)
+    in_tmproot "$path" || die "not a throwaway path: $path" 5
+  fi
+  is_registered "$path" || die "not a linked worktree of $REPO: $path" 5
+  [ "$(cd "$path" 2>/dev/null && pwd -P)" = "$MAIN" ] && die "refusing to remove the main checkout" 5
+  if ! in_tmproot "$path" && [ "$FORCE" = 0 ] && [ -n "$(cd "$path" && git status --porcelain 2>/dev/null)" ]; then
+    die "$path has uncommitted changes; commit them or pass --force" 5
+  fi
+  remove_path "$path"
+  echo "removed $path"
+  exit 0
+fi
+
+# add
+if [ -n "$DETACH" ]; then
+  mkdir -p "$TMPROOT" || die "cannot create $TMPROOT" 4
+  path="$(cd "$TMPROOT" && pwd -P)/$REPO-$SLUG"
+  if [ -e "$path" ]; then
+    if is_registered "$path"; then remove_path "$path"
+    else rm -rf -- "$path"; g worktree prune
+    fi
+  fi
+  g worktree add --detach "$path" "$DETACH" >&2 || die "git worktree add failed" 4
+  brcol=detached
+else
+  path="$(dirname "$MAIN")/$REPO-$SLUG"
+  [ -e "$path" ] && die "$path already exists" 5
+  name=${BRANCH:-$SLUG}
+  if g show-ref --verify -q "refs/heads/$name"; then
+    g worktree add "$path" "$name" >&2 || die "git worktree add failed" 4
+  else
+    if [ -z "$BASE" ]; then
+      b=$("$here/sdw-cfg" BASE_BRANCH 2>/dev/null); b=${b:-main}
+      if g rev-parse -q --verify "origin/$b" >/dev/null; then BASE="origin/$b"
+      elif g rev-parse -q --verify "$b" >/dev/null; then BASE=$b
+      else BASE=HEAD
+      fi
+    fi
+    g worktree add -b "$name" "$path" "$BASE" >&2 || die "git worktree add failed" 4
+  fi
+  brcol=$name
+fi
+
+# Untracked .env* files travel with the worktree; tracked ones are already there.
+(cd "$MAIN" && find . -maxdepth 3 \( -name node_modules -o -name .git \) -prune -o -name '.env*' -type f -print) |
+while IFS= read -r f; do
+  f=${f#./}
+  (cd "$MAIN" && git ls-files --error-unmatch -- "$f" >/dev/null 2>&1) && continue
+  mkdir -p "$path/$(dirname "$f")" && cp -p "$MAIN/$f" "$path/$f"
+done
+
+if [ "$DEPS" = 1 ]; then
+  if [ -n "$P" ] && [ -f "$P/.sdw/env.sh" ]; then . "$P/.sdw/env.sh"; fi
+  (cd "$path" && find . -maxdepth 2 -name node_modules -prune -o \
+     \( -name pnpm-lock.yaml -o -name package-lock.json -o -name yarn.lock \) -print) |
+  while IFS= read -r lock; do
+    d="$path/$(dirname "${lock#./}")"
+    case "$lock" in
+      *pnpm-lock.yaml) c="pnpm install --offline --frozen-lockfile" ;;
+      *package-lock.json) c="npm ci --prefer-offline --no-audit --no-fund" ;;
+      *yarn.lock) c="yarn install --frozen-lockfile --offline" ;;
+    esac
+    command -v "${c%% *}" >/dev/null 2>&1 || { echo "sdw-wt: warning: ${c%% *} not found; skipped $d" >&2; continue; }
+    (cd "$d" && $c) >&2 || echo "sdw-wt: warning: '$c' failed in $d" >&2
+  done
+  if ls "$path"/*.sln >/dev/null 2>&1 || ls "$path"/*.csproj >/dev/null 2>&1; then
+    if command -v dotnet >/dev/null 2>&1; then
+      (cd "$path" && dotnet restore) >&2 || echo "sdw-wt: warning: dotnet restore failed" >&2
+    fi
+  fi
+fi
+
+if [ -n "$REG" ]; then
+  mkdir -p "$(dirname "$REG")"
+  reg_drop "$path"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$SLUG" "$REPO" "$path" "$brcol" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$REG"
+fi
+printf '%s\n' "$path"

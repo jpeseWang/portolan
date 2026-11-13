@@ -1,0 +1,19 @@
+.DS_Store
+*.bak
+__pycache__/
+evals/results/
+
+# Local assistant state for working on this repo; never part of a release.
+.claude/
+.sdw/
+.mcp.json
+config.env
+*.bak*
+
+# Portolan route: this machine's settings and runtime state
+route/local.zsh
+route/projects/local/
+route/.master
+route/.dbpass
+route/proxy.log
+route/state/

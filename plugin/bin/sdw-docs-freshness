@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""How much of the local docs can still be trusted.
+
+usage: sdw-docs-freshness [--docs DIR] [--brief|--stale]
+  --docs   docs dir (default: DOCS_DIR from .sdw/config.env, relative to the project dir; else local-docs)
+           "commits behind" counts the current repo against origin/<BASE_BRANCH>
+  --brief  at most 2 lines, only when something needs work
+  --stale  table of only what needs work
+Marker near the top of each doc, fields freely combined:
+  <!-- reviewed: 2026-10-16 | against: 1a2b3c4 | status: current -->
+  <!-- fetched: 2026-10-16T09:30 | source: jira sprint 5 | ttl: 1d -->
+status closed/superseded/historical never goes stale; STATUS.md may add sprint-ends: <date>.
+An unparseable date or a fetched doc without ttl is "unknown". Dirs named daily and .git are skipped.
+exit: 0 all fresh, 1 something stale/expired/unknown, 2 usage, 4 docs dir missing
+"""
+
+import argparse
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MARKER = re.compile(r"^<!--\s*((?:reviewed|fetched)\s*:.*?)-->", re.S | re.M)
+SKIP_DIRS = {"daily", ".git"}
+HISTORY = {"closed", "superseded", "historical"}
+TTL = re.compile(r"^(\d+)\s*([hdw])$")
+REVIEW_MAX_DAYS = 30
+BAD = ("stale", "expired", "unknown")
+
+
+def cfg(key, default=""):
+    try:
+        out = subprocess.run([str(HERE / "sdw-cfg"), key, default], capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else default
+    except (OSError, subprocess.SubprocessError):
+        return default
+
+
+def projdir():
+    try:
+        out = subprocess.run([str(HERE / "sdw-workdir"), "--projdir"], capture_output=True, text=True, timeout=10)
+        return Path(out.stdout.strip()) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def parse_marker(text):
+    found = MARKER.search(text[:2000])
+    if not found:
+        return {}
+    fields = {}
+    for part in found.group(1).split("|"):
+        key, _, value = part.partition(":")
+        fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def parse_when(value):
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value or "", fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_ttl(value):
+    m = TTL.match(value or "")
+    if not m:
+        return None
+    unit = {"h": "hours", "d": "days", "w": "weeks"}[m.group(2)]
+    return timedelta(**{unit: int(m.group(1))})
+
+
+def commits_behind(repo, sha, base):
+    try:
+        out = subprocess.run(["git", "rev-list", "--count", f"{sha}..{base}"], cwd=str(repo),
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else "?"
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+
+
+def assess(path, repo, base, now):
+    meta = parse_marker(path.read_text(encoding="utf-8", errors="replace"))
+    row = {"path": path, "verdict": "unmarked", "age": "-", "behind": "-", "note": ""}
+    if not meta:
+        return row
+    status = meta.get("status", "current")
+    if status in HISTORY:
+        row["verdict"] = "history"
+        return row
+    verdict = None
+    if "fetched" in meta:
+        when, ttl = parse_when(meta["fetched"]), parse_ttl(meta.get("ttl", ""))
+        if when:
+            row["age"] = f"{(now - when).days}d"
+        if not when or not ttl:
+            verdict = "unknown"
+            row["note"] = "unparseable fetched date" if not when else "no ttl"
+        else:
+            verdict = "expired" if now - when > ttl else "fresh"
+            row["note"] = meta.get("source", "")
+    if "reviewed" in meta and verdict != "unknown":
+        when = parse_when(meta["reviewed"])
+        if not when:
+            verdict, row["note"] = "unknown", "unparseable reviewed date"
+        else:
+            days = (now - when).days
+            row["age"] = f"{days}d"
+            if meta.get("against"):
+                row["behind"] = commits_behind(repo, meta["against"], base)
+            verdict = "stale" if status == "stale" or days > REVIEW_MAX_DAYS else status
+    ends = meta.get("sprint-ends")
+    if ends:
+        end = parse_when(ends)
+        if not end:
+            verdict, row["note"] = "unknown", "unparseable sprint-ends"
+        elif end.date() < now.date():
+            verdict, row["note"] = "stale", f"sprint ended {end.date()}"
+    row["verdict"] = verdict or "unknown"
+    return row
+
+
+def collect(docs, repo, base):
+    now = datetime.now()
+    rows = []
+    for path in sorted(docs.rglob("*.md")):
+        parts = path.relative_to(docs).parts
+        if SKIP_DIRS.intersection(parts[:-1]) or path.name.startswith("_"):
+            continue
+        rows.append(assess(path, repo, base, now))
+    return rows
+
+
+ORDER = {"stale": 0, "expired": 1, "unknown": 2, "unmarked": 3, "fresh": 5, "current": 6, "history": 7}
+
+
+def brief(rows, docs):
+    lines = []
+    status = next((r for r in rows if r["path"].name == "STATUS.md"), None)
+    if status and status["verdict"] in BAD:
+        extra = f", {status['note']}" if status["note"] else ""
+        lines.append(f"docs: STATUS.md {status['verdict']} ({status['age']} old, {status['behind']} commits behind{extra});"
+                     " do not trust it before /sdw:sync")
+    counts = {}
+    for r in rows:
+        if r["verdict"] in BAD and r is not status:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    if counts:
+        lines.append("docs: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) +
+                     f"; sdw-docs-freshness --docs {shlex.quote(str(docs))} --stale")
+    for line in lines[:2]:
+        print(line)
+
+
+def table(rows, docs, only_bad):
+    rows = sorted(rows, key=lambda r: (ORDER.get(r["verdict"], 4), str(r["path"])))
+    if only_bad:
+        rows = [r for r in rows if r["verdict"] in BAD]
+    print(f"{'verdict':<10} {'age':>5} {'behind':>7}  file")
+    for r in rows:
+        note = f"  ({r['note']})" if r["note"] else ""
+        print(f"{r['verdict']:<10} {r['age']:>5} {r['behind']:>7}  {r['path'].relative_to(docs)}{note}")
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--docs", type=Path)
+    parser.add_argument("--brief", action="store_true")
+    parser.add_argument("--stale", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if args.help:
+        print(__doc__.strip())
+        return 0
+    docs = args.docs
+    if docs is None:
+        rel = cfg("DOCS_DIR") or "local-docs"
+        p = projdir()
+        docs = (p / rel) if p else Path(rel)
+    if not docs.is_dir():
+        print(f"sdw-docs-freshness: docs dir missing: {docs}", file=sys.stderr)
+        return 4
+    rows = collect(docs, Path("."), "origin/" + (cfg("BASE_BRANCH", "main") or "main"))
+    if args.brief:
+        brief(rows, docs)
+    else:
+        table(rows, docs, args.stale)
+    return 1 if any(r["verdict"] in BAD for r in rows) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

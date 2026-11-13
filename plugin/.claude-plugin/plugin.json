@@ -1,0 +1,7 @@
+{
+  "name": "sdw",
+  "version": "2.5.0",
+  "description": "Evidence-first dev workflow for client repos: gates, independent QA and review, untracked per-project state",
+  "author": { "name": "Le Nhat Quang" },
+  "license": "MIT"
+}

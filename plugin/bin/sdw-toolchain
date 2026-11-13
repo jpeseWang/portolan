@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Does the toolchain on PATH match what the repo pins?
+
+usage: sdw-toolchain [root] [--brief] [--emit-env]
+  root        dir to scan (default: .), up to three levels down
+  --brief     mismatches only, at most 3 lines (for session-start)
+  --emit-env  print env.sh lines (export PATH/DOTNET_ROOT) that select matching installs
+Reads .nvmrc, .node-version, package.json (engines.node, packageManager), global.json (rollForward),
+.python-version, go.mod, .tool-versions, .ruby-version, .java-version. Reports git, jq, gh,
+playwright-cli and uv as information.
+exit: 0 all match, 1 mismatch (or --emit-env could not fix one), 2 usage
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SKIP = {"node_modules", ".git", "dist", "build", "bin", "obj", ".venv", "venv", "vendor", ".next", "coverage", ".sdw"}
+VERSION = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+HOME = Path.home()
+
+
+def run(cmd, cwd=None):
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (out.stdout or out.stderr).strip()
+    return text if out.returncode == 0 else ""
+
+
+def parse(text):
+    m = VERSION.search(text or "")
+    return tuple(int(g or 0) for g in m.groups()) if m else None
+
+
+def satisfies(version, spec):
+    """Minimal semver range check: ||, space-joined comparators, ^ ~ x and bare versions."""
+    for alt in spec.split("||"):
+        parts = alt.replace(">= ", ">=").replace("<= ", "<=").split()
+        if parts and all(comparator_ok(version, p) for p in parts):
+            return True
+    return False
+
+
+def comparator_ok(version, comp):
+    m = re.match(r"^(>=|<=|>|<|=|\^|~)?v?", comp)
+    op, raw = m.group(1) or "", comp[m.end():]
+    want = parse(raw)
+    if want is None:
+        return True
+    given = len([p for p in raw.split(".") if p and p not in ("x", "*", "X")])
+    if op == ">=":
+        return version >= want
+    if op == ">":
+        return version > want
+    if op == "<=":
+        return version <= want
+    if op == "<":
+        return version < want
+    if op == "^":
+        return version >= want and version[0] == want[0]
+    if op == "~":
+        return version >= want and version[:2] == want[:2]
+    return version[:max(given, 1)] == want[:max(given, 1)]
+
+
+def find(root, names, depth=3):
+    for here, dirs, files in os.walk(root):
+        level = len(Path(here).relative_to(root).parts)
+        dirs[:] = sorted(d for d in dirs if d not in SKIP and not d.startswith(".") and level < depth)
+        for name in sorted(names.intersection(files)):
+            yield Path(here) / name
+
+
+def read(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+CURRENT = {"node": ["node", "--version"], "python": ["python3", "--version"], "go": ["go", "version"],
+           "ruby": ["ruby", "--version"], "java": ["java", "-version"], "pnpm": ["pnpm", "--version"],
+           "yarn": ["yarn", "--version"], "npm": ["npm", "--version"]}
+
+
+def pins(root):
+    for path in find(root, {".nvmrc", ".node-version"}):
+        spec = read(path).strip()
+        if spec:
+            yield "node", spec, path
+    for path in find(root, {"package.json"}):
+        try:
+            pkg = json.loads(read(path))
+        except ValueError:
+            continue
+        if not isinstance(pkg, dict):
+            continue
+        engines = pkg.get("engines")
+        if isinstance(engines, dict) and engines.get("node"):
+            yield "node", str(engines["node"]), path
+        manager = pkg.get("packageManager") or ""
+        if isinstance(manager, str) and "@" in manager:
+            name, _, ver = manager.partition("@")
+            if name in CURRENT:
+                yield name, ver.split("+")[0], path
+    for path in find(root, {".python-version"}):
+        words = read(path).split()
+        if words and words[0] != "system":
+            yield "python", words[0], path
+    for path in find(root, {"go.mod"}):
+        m = re.search(r"^go\s+(\S+)", read(path), re.M)
+        if m:
+            yield "go", ">=" + m.group(1), path
+    for name, tool in ((".ruby-version", "ruby"), (".java-version", "java")):
+        for path in find(root, {name}):
+            spec = read(path).strip()
+            if spec:
+                yield tool, spec, path
+    alias = {"nodejs": "node", "node": "node", "python": "python", "golang": "go", "ruby": "ruby", "java": "java"}
+    for path in find(root, {".tool-versions"}):
+        for line in read(path).splitlines():
+            bits = line.split()
+            if len(bits) >= 2 and bits[0] in alias:
+                yield alias[bits[0]], bits[1], path
+
+
+def roll_ok(have, want, policy):
+    """global.json rollForward: is SDK `have` acceptable for `want`?"""
+    if have is None or want is None:
+        return False
+    band = lambda v: (v[0], v[1], v[2] // 100)
+    policy = (policy or "patch").lower()
+    if have < want:
+        return False
+    if policy == "disable":
+        return have == want
+    if policy in ("patch", "latestpatch"):
+        return band(have) == band(want)
+    if policy in ("feature", "latestfeature"):
+        return have[:2] == want[:2]
+    if policy in ("minor", "latestminor"):
+        return have[0] == want[0]
+    return True
+
+
+def dotnet_rows(root):
+    for path in find(root, {"global.json"}):
+        try:
+            sdk = json.loads(read(path)).get("sdk", {})
+        except (ValueError, AttributeError):
+            continue
+        want = parse(str(sdk.get("version", ""))) if isinstance(sdk, dict) else None
+        if not want:
+            continue
+        policy = sdk.get("rollForward", "patch")
+        got = run(["dotnet", "--version"], cwd=path.parent)
+        have = parse(got) if got else None
+        ok = have is not None
+        shown = got if have else ("not on PATH" if got is None else "no SDK matching global.json")
+        yield "dotnet", f"{sdk.get('version')} (rollForward {policy})", path, shown, ok, (want, policy)
+
+
+def candidates(tool, spec):
+    """Install dirs (bin paths) that satisfy spec, best first."""
+    found = []
+    if tool == "node":
+        for d in (HOME / ".nvm/versions/node").glob("v*"):
+            v = parse(d.name)
+            if v and (spec in ("lts/*", "node", "latest") or satisfies(v, spec.lstrip("v"))):
+                found.append((v, d / "bin"))
+        for d in Path("/opt/homebrew/opt").glob("node@*"):
+            v = parse(run([str(d / "bin/node"), "--version"]) or "")
+            if v and satisfies(v, spec.lstrip("v")):
+                found.append((v, d / "bin"))
+    if tool == "python":
+        for d in (HOME / ".pyenv/versions").glob("*"):
+            v = parse(d.name)
+            if v and satisfies(v, spec):
+                found.append((v, d / "bin"))
+    found.sort(reverse=True)
+    return [p for _, p in found]
+
+
+def home_rel(path):
+    s = str(path)
+    h = str(HOME)
+    return "$HOME" + s[len(h):] if s == h or s.startswith(h + "/") else s
+
+
+def emit_env(rows, dotnet):
+    lines, unresolved, paths = ["# generated by sdw-toolchain --emit-env"], [], []
+    for tool, spec, _, _, ok in rows:
+        if ok:
+            continue
+        c = candidates(tool, spec.strip())
+        if c:
+            if c[0] not in paths:
+                paths.append(c[0])
+        else:
+            unresolved.append(f"{tool} {spec}")
+    for want, policy in dotnet:
+        root = HOME / ".dotnet"
+        sdks = [parse(p.name) for p in (root / "sdk").glob("*") if parse(p.name)]
+        if any(roll_ok(v, want, policy) for v in sdks):
+            lines.append(f'export DOTNET_ROOT="{home_rel(root)}"')
+            paths.append(root)
+        else:
+            unresolved.append("dotnet " + ".".join(map(str, want)))
+    sdw = None
+    here = Path.cwd().resolve()
+    for d in [here] + list(here.parents):
+        if (d / ".sdw").is_dir() and d != HOME:
+            sdw = d / ".sdw"
+            break
+    if sdw and (sdw / "state/corepack-bin").is_dir():
+        paths.append(sdw / "state/corepack-bin")
+    for p in paths:
+        lines.append(f'export PATH="{home_rel(p)}:$PATH"')
+    for u in unresolved:
+        lines.append(f"# no local install found for {u}")
+    print("\n".join(lines))
+    return 1 if unresolved else 0
+
+
+def info_lines():
+    out = []
+    for name, cmd in (("git", ["git", "--version"]), ("jq", ["jq", "--version"]), ("gh", ["gh", "--version"]),
+                      ("playwright-cli", ["playwright-cli", "--version"]), ("uv", ["uv", "--version"]),
+                      ("corepack", ["corepack", "--version"])):
+        got = run(cmd)
+        v = parse(got) if got else None
+        out.append(f"info {name}: {'.'.join(map(str, v)) if v else ('missing' if got is None else 'present')}")
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return 0
+    brief = "--brief" in args
+    emit = "--emit-env" in args
+    rest = [a for a in args if a not in ("--brief", "--emit-env")]
+    if len(rest) > 1 or any(a.startswith("-") for a in rest):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    root = Path(rest[0] if rest else ".").resolve()
+    if not root.is_dir():
+        print(f"sdw-toolchain: not a directory: {root}", file=sys.stderr)
+        return 2
+
+    rows, cache = [], {}
+    for tool, spec, path in pins(root):
+        if tool not in cache:
+            cache[tool] = run(CURRENT[tool]) if tool in CURRENT else None
+        got = cache[tool]
+        version = parse(got) if got else None
+        clean = spec.strip().lstrip("v")
+        ok = version is not None and (clean in ("lts/*", "node", "latest", "*") or satisfies(version, clean))
+        rows.append((tool, spec, path, got or "not on PATH", ok))
+    dn = list(dotnet_rows(root))
+    if emit:
+        return emit_env(rows, [r[5] for r in dn if not r[4]])
+    rows += [r[:5] for r in dn]
+
+    bad = [r for r in rows if not r[4]]
+    if brief:
+        lines = []
+        for tool, spec, path, got, _ in bad:
+            lines.append(f"toolchain: {tool} wants {spec} ({path.relative_to(root)}), shell has {got}")
+        if len(lines) > 2:
+            lines = lines[:2] + [f"toolchain: +{len(bad) - 2} more; run sdw-toolchain"]
+        if bad and len(lines) < 3:
+            lines.append("toolchain: fix with sdw-toolchain --emit-env > .sdw/env.sh, then restart the session")
+        if lines:
+            print("\n".join(lines[:3]))
+    else:
+        for tool, spec, path, got, ok in rows:
+            print(f"{'ok  ' if ok else 'MISMATCH'} {tool}: repo wants {spec} ({path.relative_to(root)}), shell has {got}")
+        for line in info_lines():
+            print(line)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq jq shellcheck python3-pil zsh
+          else
+            command -v jq >/dev/null || brew install jq
+            python3 -c 'import PIL' 2>/dev/null ||
+              python3 -m pip install --user --break-system-packages Pillow ||
+              python3 -m pip install --user Pillow
+          fi
+          git --version; jq --version; python3 --version
+
+      - name: Syntax (bash -n, python ast, node --check)
+        run: |
+          rc=0
+          for f in bootstrap.sh tests/run.sh tests/*/*.sh plugin/bin/* plugin/hooks/*.sh route/setup.sh route/bin/*; do
+            [ -f "$f" ] || continue
+            case "$(head -1 "$f")" in
+              '#!'*python3*) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" || rc=1 ;;
+              '#!'*node*) node --check "$f" || rc=1 ;;
+              *) bash -n "$f" || rc=1; [ "$RUNNER_OS" != macOS ] || /bin/bash -n "$f" || rc=1 ;;
+            esac
+          done
+          for f in route/env.zsh route/local.example.zsh route/projects/*.zsh; do [ -f "$f" ] && { zsh -n "$f" || rc=1; }; done
+          for f in plugin/libexec/*.mjs; do [ -f "$f" ] && { node --check "$f" || rc=1; }; done
+          for f in plugin/skills/*/*.py tests/*/*.py route/*.py; do
+            [ -f "$f" ] && { python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" || rc=1; }
+          done
+          exit $rc
+
+      - name: Executable bits
+        run: |
+          rc=0
+          for f in bootstrap.sh tests/run.sh tests/*/test-*.sh plugin/bin/* plugin/hooks/*.sh route/setup.sh route/bin/*; do
+            [ -f "$f" ] || continue
+            [ "$f" = plugin/hooks/lib.sh ] && continue
+            [ -x "$f" ] || { echo "::error file=$f::not executable"; rc=1; }
+          done
+          exit $rc
+
+      - name: ShellCheck
+        if: runner.os == 'Linux'
+        run: |
+          files=$(for f in bootstrap.sh tests/run.sh plugin/bin/* plugin/hooks/*.sh route/setup.sh route/bin/*; do
+            [ -f "$f" ] && case "$(head -1 "$f")" in '#!'*python3*|'#!'*node*) ;; *) echo "$f" ;; esac; done)
+          shellcheck --version | sed -n 2p
+          shellcheck -x -s bash -S warning -e SC1090,SC1091 $files
+
+      - name: Manifests are valid JSON
+        run: |
+          for f in .claude-plugin/marketplace.json plugin/.claude-plugin/plugin.json plugin/hooks/hooks.json templates/user-settings.json route/routing.json; do
+            jq -e . "$f" >/dev/null || { echo "::error file=$f::invalid or missing JSON"; exit 1; }
+          done
+          jq -e '.hooks | type == "object"' plugin/hooks/hooks.json >/dev/null ||
+            { echo "::error::hooks.json needs the top-level \"hooks\" wrapper"; exit 1; }
+
+      - name: Tests
+        run: tests/run.sh

@@ -1,0 +1,14 @@
+# Proxy for pay-per-token APIs only (DeepSeek, Gemini). Subscriptions (claude, codex) stay native.
+model_list:
+  - model_name: ds-chat
+    litellm_params: { model: deepseek/deepseek-chat, api_key: os.environ/DEEPSEEK_API_KEY }
+  - model_name: ds-think
+    litellm_params: { model: deepseek/deepseek-reasoner, api_key: os.environ/DEEPSEEK_API_KEY }
+  # Uncomment after: security add-generic-password -s gemini-api -a "$USER" -w
+  # - model_name: gem-long
+  #   litellm_params: { model: gemini/gemini-2.5-pro, api_key: os.environ/GEMINI_API_KEY }
+
+litellm_settings:
+  drop_params: true
+  max_budget: 5        # USD hard cap across the proxy
+  budget_duration: 1d

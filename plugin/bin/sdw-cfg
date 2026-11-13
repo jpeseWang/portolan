@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Read one key from <projdir>/.sdw/config.env. Secrets never live there; secret-looking keys are refused.
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-cfg KEY [default]   print the value, else the default (built-in defaults apply)
+       sdw-cfg --has KEY       exit 0 when set, 1 when unset; prints nothing
+exit: 0 ok, 1 unset (--has), 2 usage, 5 secret-looking key
+EOF
+}
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+MODE="get"
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --has) MODE=has; shift ;;
+  "") usage >&2; exit 2 ;;
+esac
+
+P=$("$here/sdw-workdir" --projdir 2>/dev/null) || P=""
+FILE=""
+[ -n "$P" ] && FILE="$P/.sdw/config.env"
+
+KEY=${1:-}
+[ -n "$KEY" ] || { usage >&2; exit 2; }
+if ! printf '%s' "$KEY" | grep -Eq '^[A-Z][A-Z0-9_]*$'; then
+  echo "sdw-cfg: invalid key: $KEY" >&2; exit 2
+fi
+if printf '%s' "$KEY" | grep -Eq 'TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|CREDENTIAL'; then
+  echo "sdw-cfg: $KEY looks secret; secrets live in the Keychain, not config.env" >&2; exit 5
+fi
+
+VALUE="" FOUND=0
+if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in "export "*) line=${line#export }; line=${line#"${line%%[![:space:]]*}"} ;; esac
+    case "$line" in "$KEY="*) ;; *) continue ;; esac
+    v=${line#"$KEY="}
+    case "$v" in
+      \"*) v=${v#\"}; v=${v%%\"*} ;;
+      \'*) v=${v#\'}; v=${v%%\'*} ;;
+      *) v=${v%%[[:space:]]#*}; v=${v%"${v##*[![:space:]]}"} ;;
+    esac
+    VALUE=$v FOUND=1
+  done < "$FILE"
+fi
+[ -n "$VALUE" ] || FOUND=0
+
+if [ "$MODE" = has ]; then
+  [ "$FOUND" = 1 ]; exit $?
+fi
+
+if [ "$FOUND" = 1 ]; then printf '%s\n' "$VALUE"; exit 0; fi
+if [ $# -ge 2 ]; then printf '%s\n' "$2"; exit 0; fi
+
+case "$KEY" in
+  BASE_BRANCH) echo main ;;
+  VCS_HOST) echo github ;;
+  TRACKER) echo none ;;
+  BRANCH_PATTERN) echo '{key}-{slug}' ;;
+  PR_TITLE_PATTERN) echo '{key}: {summary}' ;;
+  JIRA_FLAVOR) echo cloud ;;
+  JIRA_AUTH)
+    if [ "$("$0" JIRA_FLAVOR)" = dc ]; then echo bearer; else echo basic; fi ;;
+  WORKLOG|DB_LOCAL|FIGMA_MCP_BUDGET) echo 0 ;;
+  PROJ_SLUG)
+    base=$P
+    [ -n "$base" ] || base=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+    basename "$base" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]/-/g' ;;
+  *) echo "" ;;
+esac

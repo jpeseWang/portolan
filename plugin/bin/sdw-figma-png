@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Exit: 0 path printed, 1 API error (status on stderr), 2 usage, 3 not onboarded, 4 token,
+# curl or python3 missing. Only files/<key>/meta and images/<key> are called: /nodes
+# rate-limits for well over 20 minutes.
+set -u
+here=$(cd "$(dirname "$0")" && pwd -P)
+me=sdw-figma-png
+api=https://api.figma.com
+
+usage() {
+  cat <<'EOF'
+usage: sdw-figma-png <fileKey> <nodeId> [--scale N] [--format png|svg]
+
+Renders one Figma node through the REST images endpoint and caches it in
+.sdw/design-refs/<fileKey>/<nodeId with : as ->@<scale>x-<lastModified>.<format>.
+A cached render for the file's current lastModified is reused without an images call.
+Token: Keychain service sdw:figma. Prints the absolute image path.
+EOF
+}
+
+die() { echo "$me: $2" >&2; exit "$1"; }
+
+key="" node="" scale=2 fmt=png
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --scale) [ $# -ge 2 ] || die 2 "--scale needs a value"; scale=$2; shift 2 ;;
+    --format) [ $# -ge 2 ] || die 2 "--format needs a value"; fmt=$2; shift 2 ;;
+    -*) die 2 "unknown option $1" ;;
+    *) if [ -z "$key" ]; then key=$1; elif [ -z "$node" ]; then node=$1; else die 2 "too many arguments"; fi; shift ;;
+  esac
+done
+[ -n "$key" ] && [ -n "$node" ] || { usage >&2; exit 2; }
+printf '%s' "$key" | grep -Eq '^[A-Za-z0-9]+$' || die 2 "fileKey must be alphanumeric"
+node=$(printf '%s' "$node" | tr '-' ':')
+printf '%s' "$node" | grep -Eq '^[A-Za-z0-9:;]+$' || die 2 "nodeId looks like 12:345 or 12-345"
+printf '%s' "$scale" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || die 2 "--scale must be a number"
+case "$fmt" in png|svg) ;; *) die 2 "--format png|svg" ;; esac
+
+command -v curl >/dev/null 2>&1 || die 4 "curl not found"
+command -v python3 >/dev/null 2>&1 || die 4 "python3 not found"
+[ -x "$here/sdw-workdir" ] || die 4 "sdw-workdir missing beside $me"
+pd=$("$here/sdw-workdir" --projdir 2>/dev/null)
+[ $? -eq 0 ] && [ -n "$pd" ] || die 3 "not onboarded (run /sdw:onboard)"
+
+nslug=$(printf '%s' "$node" | tr ':;' '--')
+dir="$pd/.sdw/design-refs/$key"
+stem="$nslug@${scale}x"
+
+tok=$(security find-generic-password -s sdw:figma -w 2>/dev/null) \
+  || die 4 "Keychain item sdw:figma missing; store it with: security add-generic-password -U -s 'sdw:figma' -a figma -w"
+[ -n "$tok" ] || die 4 "Keychain item sdw:figma is empty"
+
+tmpd=$(mktemp -d "${TMPDIR:-/tmp}/sdw-figma.XXXXXX") || die 4 "mktemp failed"
+trap 'rm -rf "$tmpd"' EXIT
+
+figma_get() {
+  printf 'header = "X-Figma-Token: %s"\n' "$tok" \
+    | curl -sS -K - --max-time 60 -o "$2" -w '%{http_code}' "$api$1" 2>/dev/null
+}
+
+json_field() {
+  python3 -I -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+for path in sys.argv[2:]:
+    v = d
+    for part in path.split("/"):
+        v = v.get(part) if isinstance(v, dict) else None
+    if isinstance(v, (str, int)) and str(v):
+        print(v)
+        sys.exit(0)
+sys.exit(1)
+' "$@"
+}
+
+newest_cached() {
+  ls -t "$dir/$stem-"*".$fmt" 2>/dev/null | head -n 1
+}
+
+code=$(figma_get "/v1/files/$key/meta" "$tmpd/meta.json")
+mod=""
+if [ "$code" = 200 ]; then
+  mod=$(json_field "$tmpd/meta.json" file/last_touched_at file/lastModified lastModified file/version version)
+fi
+if [ -z "$mod" ]; then
+  cached=$(newest_cached)
+  if [ -n "$cached" ]; then
+    echo "$me: meta HTTP ${code:-none}, cache (unverified)" >&2
+    echo "$cached"
+    exit 0
+  fi
+  die 1 "meta request failed: HTTP ${code:-none}"
+fi
+
+mslug=$(printf '%s' "$mod" | tr -c 'A-Za-z0-9.\n' '-' | tr -d '\n')
+target="$dir/$stem-$mslug.$fmt"
+if [ -s "$target" ]; then
+  echo "$target"
+  exit 0
+fi
+
+ids=$(printf '%s' "$node" | sed 's/:/%3A/g; s/;/%3B/g')
+code=$(figma_get "/v1/images/$key?ids=$ids&scale=$scale&format=$fmt" "$tmpd/images.json")
+[ "$code" = 200 ] || die 1 "images request failed: HTTP ${code:-none}"
+src=$(json_field "$tmpd/images.json" "images/$node") || die 1 "images response has no render for $node"
+
+code=$(curl -sS --max-time 120 -o "$tmpd/render" -w '%{http_code}' "$src" 2>/dev/null)
+[ "$code" = 200 ] && [ -s "$tmpd/render" ] || die 1 "render download failed: HTTP ${code:-none}"
+mkdir -p "$dir" || die 4 "cannot create $dir"
+mv "$tmpd/render" "$target" || die 4 "cannot write $target"
+echo "$target"

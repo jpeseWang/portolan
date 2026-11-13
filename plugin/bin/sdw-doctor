@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Self-test of the installed plugin and this project's sdw state. One PASS/WARN/FAIL line per check.
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-doctor     check hooks, gates, project.md size, exclude block, env.sh, shadowed AGENTS.md, v1 leftovers, Keychain names,
+                  plaintext secrets in Claude config (names only)
+exit: 0 no FAIL, 1 a FAIL, 2 usage
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0 ;; "") ;; *) usage >&2; exit 2 ;; esac
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+ROOT=$(cd "$here/.." && pwd -P)
+HOOKS="$ROOT/hooks"
+FAIL=0
+say() { echo "$1 $2: $3"; [ "$1" = FAIL ] && FAIL=1; return 0; }
+
+if command -v jq >/dev/null 2>&1; then say PASS json "jq"
+elif command -v python3 >/dev/null 2>&1; then say PASS json "python3 (jq missing)"
+else say FAIL json "neither jq nor python3; guards block every call"
+fi
+
+valid_json() {
+  if command -v jq >/dev/null 2>&1; then jq -e . >/dev/null 2>&1
+  else python3 -c 'import json, sys; json.load(sys.stdin)' >/dev/null 2>&1
+  fi
+}
+hook() { CLAUDE_PLUGIN_ROOT="$ROOT" CLAUDE_ENV_FILE="" "$HOOKS/$1"; }
+pwdj=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+out=$(printf '{"session_id":"sdw-doctor","cwd":"%s","source":"startup"}' "$pwdj" | hook session-start.sh 2>/dev/null)
+if [ -n "$out" ] && printf '%s' "$out" | valid_json; then say PASS session-start "valid JSON, $(printf '%s' "$out" | wc -c | tr -d ' ') bytes"
+else say FAIL session-start "no valid JSON on stdout"
+fi
+
+printf '{"cwd":"%s","tool_input":{"command":"rm -rf /"}}' "$pwdj" | hook guard-bash.sh >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && say PASS guard-bash "rm -rf / blocked" || say FAIL guard-bash "rm -rf / gave exit $rc, not 2"
+printf '{"cwd":"%s","tool_input":{"file_path":"%s/.env"}}' "$pwdj" "$pwdj" | hook guard-write.sh >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && say PASS guard-write ".env blocked" || say FAIL guard-write ".env gave exit $rc, not 2"
+printf '{"tool_name":"Read","cwd":"%s","tool_input":{"file_path":"%s/.env"}}' "$pwdj" "$pwdj" | hook guard-read.sh >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && say PASS guard-read ".env blocked" || say FAIL guard-read ".env gave exit $rc, not 2"
+
+P=$("$here/sdw-workdir" --projdir 2>/dev/null) || P=""
+if [ -n "$P" ]; then dirs="$P
+$("$here/sdw-workdir" --repos 2>/dev/null)"
+else dirs=$(git rev-parse --show-toplevel 2>/dev/null) || dirs=$PWD
+fi
+if command -v python3 >/dev/null 2>&1; then
+  out=$(printf '%s\n' "$dirs" | python3 -I -c '
+import json, os, re, sys
+from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+home = Path.home()
+NAME = re.compile(r"authoriz|bearer|token|secret|passw|api[-_]?key|private[-_]?key|access[-_]?key|credential|cookie|key$", re.I)
+REF = re.compile(r"\$\{?[A-Za-z_]")
+SCHEME = re.compile(r"(bearer|basic|token)\s+\S", re.I)
+SCHEME_IN = re.compile(r"\b(bearer|basic|token)\s+(?=[^\s]*\d)[A-Za-z0-9._~+/=-]{8,}", re.I)
+WORD = re.compile(r"[A-Za-z0-9_./+=:-]+")
+ARGNAME = re.compile(r"-{0,2}([A-Za-z_][A-Za-z0-9_-]*)")
+
+
+def secret(k, v):
+    if not isinstance(v, str) or not v.strip() or REF.search(v):
+        return False
+    if SCHEME.match(v) or SCHEME_IN.search(v):
+        return True
+    if v.isdigit() and not re.search(r"passw|secret|passcode", k, re.I):
+        return False
+    if NAME.search(k):
+        return len(v) >= 6 and v.lower() not in ("true", "false", "null") and not re.fullmatch(r"https?://[^\s@?]+", v)
+    if not WORD.fullmatch(v) or v.startswith(("/", "~", ".", "http")) or not re.search(r"\d", v):
+        return False
+    return len(v) >= 32 or (len(v) >= 12 and re.search(r"[a-z]", v) and re.search(r"[A-Z]", v))
+
+
+def kv(where, d, out):
+    if isinstance(d, dict):
+        out.extend(f"{where}.{k}" for k, v in d.items() if secret(k, v))
+
+
+def args(where, a, out):
+    if not isinstance(a, list):
+        return
+    prev = ""
+    for i, v in enumerate(a):
+        if not isinstance(v, str):
+            prev = ""
+            continue
+        m = ARGNAME.fullmatch(v.split("=", 1)[0]) if "=" in v else None
+        flag = prev.startswith("-") and ARGNAME.fullmatch(prev) and NAME.search(prev)
+        if (m and secret(m.group(1), v.split("=", 1)[1])) or (flag and not v.startswith("-") and secret(prev, v)) \
+                or (not m and not v.startswith("-") and secret("", v)):
+            out.append(f"{where}[{i}]")
+        prev = v
+
+
+def url(where, u, out):
+    if not isinstance(u, str) or REF.search(u):
+        return
+    try:
+        p = urlsplit(u)
+        q = parse_qsl(p.query, keep_blank_values=True)
+        user, pw = p.username, p.password
+    except ValueError:
+        return
+    if pw or (user and secret("", user)) or any(secret(k, v) for k, v in q):
+        out.append(where)
+
+
+def servers(where, d, out):
+    if isinstance(d, dict):
+        for name, srv in d.items():
+            if isinstance(srv, dict):
+                kv(f"{where}.{name}.headers", srv.get("headers"), out)
+                kv(f"{where}.{name}.env", srv.get("env"), out)
+                args(f"{where}.{name}.args", srv.get("args"), out)
+                url(f"{where}.{name}.url", srv.get("url"), out)
+
+
+cdir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+files = [(home / ".claude.json", "user"), (cdir / ".claude.json", "user")]
+files += [(f, "settings") for f in sorted(cdir.glob("settings*.json"))]
+for d in [x for x in sys.stdin.read().splitlines() if x]:
+    files.append((Path(d) / ".mcp.json", "mcp"))
+    files += [(f, "settings") for f in sorted((Path(d) / ".claude").glob("settings*.json"))]
+seen = set()
+for f, kind in files:
+    if f in seen or not f.is_file():
+        continue
+    seen.add(f)
+    try:
+        show = "~/" + str(f.relative_to(home))
+    except ValueError:
+        show = str(f)
+    try:
+        data = json.loads(f.read_text())
+    except Exception:
+        print("! " + show + ": not valid JSON, not scanned")
+        continue
+    if not isinstance(data, dict):
+        continue
+    hits = []
+    if kind == "settings":
+        kv("env", data.get("env"), hits)
+    else:
+        servers("mcpServers", data.get("mcpServers"), hits)
+    if kind == "user" and isinstance(data.get("projects"), dict):
+        for proj, cfg in data["projects"].items():
+            if isinstance(cfg, dict):
+                servers(f"projects[{json.dumps(proj)}].mcpServers", cfg.get("mcpServers"), hits)
+    if hits:
+        print(show + ": " + ", ".join(hits))
+' 2>/dev/null); rc=$?
+  if [ "$rc" != 0 ]; then say WARN secrets "scan failed (exit $rc); Claude config not checked"
+  elif [ -n "$out" ]; then
+    while IFS= read -r l; do
+      case "$l" in "! "*) say WARN secrets "${l#! }" ;; *) say WARN secrets "$l (use \${VAR} from Keychain, see docs/mcp.md; rotate the secret)" ;; esac
+    done <<EOF
+$out
+EOF
+  else say PASS secrets "no plaintext secret in Claude config (names only)"
+  fi
+else
+  say WARN secrets "python3 missing; Claude config not scanned"
+fi
+
+[ -n "$P" ] || { echo "INFO onboarding: no .sdw/ here; project checks skipped"; exit $FAIL; }
+SDW="$P/.sdw"
+
+if out=$("$here/sdw-gate" --list 2>&1); then say PASS gates "$(printf '%s\n' "$out" | grep -c .) keys"
+else say FAIL gates "$(printf '%s\n' "$out" | tail -n 1)"
+fi
+if out=$("$here/sdw-gate" --dry-run 2>&1); then say PASS gate-dry-run "$(printf '%s\n' "$out" | grep -c .) gates for current changes"
+else say FAIL gate-dry-run "$(printf '%s\n' "$out" | tail -n 1)"
+fi
+if out=$("$here/sdw-exclude" --check 2>&1); then say PASS exclude "block present in every repo"
+else say FAIL exclude "$(printf '%s\n' "$out" | grep -v '^ok ' | head -n 2 | paste -sd ';' -) (run sdw-exclude)"
+fi
+if [ -f "$SDW/env.sh" ]; then
+  if out=$(bash -u -c '. "$1"' _ "$SDW/env.sh" 2>&1) && [ -z "$out" ]; then say PASS env.sh "sources cleanly under bash -u"
+  else say FAIL env.sh "${out:-prints output}"
+  fi
+else
+  say PASS env.sh "none (no toolchain overrides)"
+fi
+
+if [ -f "$SDW/project.md" ]; then
+  pl=$(grep -c '' "$SDW/project.md"); pb=$(wc -c < "$SDW/project.md" | tr -d ' ')
+  if [ "$pl" -gt 40 ] || [ "$pb" -gt 2500 ]; then say WARN project.md "$pl lines, $pb bytes; session start injects 40 lines / 2,500 bytes"
+  else say PASS project.md "$pl lines, $pb bytes"
+  fi
+fi
+
+# A CLAUDE.md in a dir or any ancestor hides an AGENTS.md beside it unless the opt-in is on.
+shadow=""
+while IFS= read -r d; do
+  [ -f "$d/AGENTS.md" ] || continue
+  a=$d
+  while [ "$a" != / ]; do
+    if [ -f "$a/CLAUDE.md" ] && ! grep -q '@AGENTS.md' "$a/CLAUDE.md" 2>/dev/null; then shadow="$shadow $d/AGENTS.md"; break; fi
+    a=$(dirname "$a")
+  done
+done <<EOF
+$P
+$("$here/sdw-workdir" --repos 2>/dev/null)
+EOF
+[ -n "$shadow" ] && say WARN agents-md "shadowed by a CLAUDE.md:$shadow (bootstrap --agents-md)" || say PASS agents-md "none shadowed"
+
+v1=""
+while IFS= read -r r; do
+  [ -n "$r" ] && [ -d "$r/.claude" ] || continue
+  f=$(grep -rl 'solo-dev-workflow:generated' "$r/.claude" 2>/dev/null | head -n 3 | paste -sd ' ' -)
+  [ -n "$f" ] && v1="$v1 $f"
+done <<EOF
+$("$here/sdw-workdir" --repos 2>/dev/null)
+EOF
+[ -n "$v1" ] && say WARN v1-leftovers "${v1# } (bootstrap.sh --migrate)" || say PASS v1-leftovers "none"
+
+# Expected items as "<service>\t<account>"; the second user of a role shares the service.
+missing="" items=""
+if [ "$("$here/sdw-cfg" TRACKER)" = jira ]; then
+  u=$("$here/sdw-cfg" JIRA_BASE_URL); items="sdw:jira:${u%/}	"
+fi
+[ -n "$("$here/sdw-cfg" FIGMA_FILE_KEY)" ] && items="$items
+sdw:figma	"
+slug=$("$here/sdw-cfg" PROJ_SLUG)
+if [ -f "$SDW/run.md" ]; then
+  # Header recipes without {pass} need no secret.
+  secretless=$(awk '/^## /{ s = ($0 ~ /^## login/) } s && /^- kind:[[:space:]]*header/ { h = 1 } s && /^- header:/ && /\{pass\}/ { p = 1 }
+    END { print (h && !p) ? 1 : 0 }' "$SDW/run.md")
+  if [ "$secretless" = 0 ]; then
+    items="$items
+$(awk -v slug="$slug" '/^## /{ s = ($0 ~ /^## users[[:space:]]*$/) } s && /^- [a-z0-9-]+:/ {
+      line = substr($0, 3); i = index(line, ":"); r = substr(line, 1, i - 1); n = split(substr(line, i + 1), u, ",")
+      for (k = 1; k <= n && k <= 2; k++) { gsub(/^[ \t]+|[ \t]+$/, "", u[k]); if (u[k] != "") printf "sdw:%s:%s\t%s\n", slug, r, u[k] } }' "$SDW/run.md")"
+  fi
+fi
+if command -v security >/dev/null 2>&1; then
+  while IFS="$(printf '\t')" read -r s a; do
+    [ -n "$s" ] || continue
+    if [ -n "$a" ]; then
+      security find-generic-password -s "$s" -a "$a" >/dev/null 2>&1 || missing="$missing $s ($a)"
+    else
+      security find-generic-password -s "$s" >/dev/null 2>&1 || missing="$missing $s"
+    fi
+  done <<EOF
+$items
+EOF
+  [ -n "$missing" ] && say WARN keychain "missing:$missing" || say PASS keychain "expected items present (names only)"
+else
+  say WARN keychain "security(1) not found"
+fi
+
+S="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+attr=""
+if [ -f "$S" ]; then
+  if command -v jq >/dev/null 2>&1; then attr=$(jq -r '[.attribution.commit, .attribution.pr] | map(if . == "" then "empty" else "set" end) | join(",")' "$S" 2>/dev/null)
+  else attr=$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1])).get("attribution",{}); print(",".join("empty" if a.get(k)=="" else "set" for k in ("commit","pr")))' "$S" 2>/dev/null)
+  fi
+fi
+# A repo whose own history already carries Claude trailers has chosen attribution.
+# shellcheck disable=SC2088
+if [ "$attr" = "empty,empty" ]; then say PASS attribution "commit and pr are empty"
+elif git log -50 --format=%B 2>/dev/null | grep -qi '^co-authored-by: claude'; then say PASS attribution "this repo's history carries Claude trailers"
+else say WARN attribution "~/.claude/settings.json attribution.commit/pr not both \"\" (bootstrap.sh)"
+fi
+
+exit $FAIL

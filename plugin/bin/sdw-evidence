@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""Evidence stamps and entries in <workdir>/evidence.jsonl; validity is checked against HEAD's tree.
+
+usage: sdw-evidence stamp [--path P]...
+       sdw-evidence add --kind K --key KEY --result R [--path P]... [--detail TEXT] [--artifact F]...
+       sdw-evidence list [--valid-for REF|WORKTREE] [--kind K]
+       sdw-evidence check [--lane L]
+       sdw-evidence qa-verdict [--lane L] [--write]
+       sdw-evidence pr-lines
+qa-verdict computes the QA verdict from cases.md, its design snapshot, bugs/, plan.md, qa-report.md
+and shots/ (exit criteria); --write puts it on qa-report.md's Verdict: line.
+exit: 0 ok, 1 blocked (check) or NOT READY (qa-verdict), 2 usage, 3 not onboarded, 4 missing prerequisite
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+
+HERE = Path(os.path.realpath(sys.argv[0])).parent
+KINDS = {"gate:full", "redcheck", "ui-diff"}
+PROVEN = {"RED(assertion)", "RED(mutation)"}
+DOC = re.compile(r"(\.(md|mdx|txt)$)|^docs/|^local-docs/")
+STAMP = re.compile(r"^<!--\s*sdw-stamp\s+(\{.*\})\s*-->")
+READY = ("READY", "READY WITH KNOWN ISSUES")
+
+
+def die(msg, code):
+    print(f"sdw-evidence: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def git(args, cwd, env=None):
+    try:
+        out = subprocess.run(["git", "-c", "core.quotepath=false"] + args, cwd=cwd, capture_output=True,
+                             text=True, env=env)
+    except OSError:
+        return 1, ""
+    return out.returncode, out.stdout.strip()
+
+
+def sibling(name, *args, cwd=None, stdin=None):
+    try:
+        out = subprocess.run([str(HERE / name)] + list(args), cwd=cwd, capture_output=True, text=True, input=stdin)
+    except OSError:
+        return 127, ""
+    return out.returncode, out.stdout
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def toplevel(cwd="."):
+    rc, top = git(["rev-parse", "--show-toplevel"], cwd)
+    return os.path.realpath(top) if rc == 0 and top else None
+
+
+def repo_name(top):
+    rc, common = git(["rev-parse", "--git-common-dir"], top)
+    if rc != 0:
+        return os.path.basename(top)
+    common = os.path.realpath(os.path.join(top, common))
+    return os.path.basename(os.path.dirname(common)) if os.path.basename(common) == ".git" else os.path.basename(top)
+
+
+def head(top):
+    rc, sha = git(["rev-parse", "-q", "--verify", "HEAD"], top)
+    return sha if rc == 0 else ""
+
+
+def worktree_tree(top):
+    rc, idx = git(["rev-parse", "--git-path", "index"], top)
+    idx = os.path.join(top, idx) if rc == 0 else ""
+    tmpdir = tempfile.mkdtemp(prefix="sdw-index.")
+    try:
+        tmp = os.path.join(tmpdir, "index")
+        if idx and os.path.isfile(idx):
+            shutil.copy2(idx, tmp)
+        env = dict(os.environ, GIT_INDEX_FILE=tmp)
+        git(["add", "-A"], top, env)
+        rc, tree = git(["write-tree"], top, env)
+        return tree if rc == 0 else ""
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def workdir():
+    if os.environ.get("SDW_WD"):
+        return Path(os.environ["SDW_WD"])
+    rc, out = sibling("sdw-workdir")
+    if rc != 0:
+        sys.exit(rc)
+    return Path(out.strip())
+
+
+def checkouts():
+    """repo name -> checkout, the $PWD work tree first (same order as sdw-gate)."""
+    found = {}
+    top = toplevel()
+    if top:
+        found[repo_name(top)] = top
+    rc, out = sibling("sdw-workdir", "--repos")
+    for line in out.splitlines() if rc == 0 else []:
+        name = repo_name(line)
+        found.setdefault(name, line)
+    return found
+
+
+def change_set():
+    """[(checkout, repo, path)] of the branch change set (sdw-gate --changes --full)."""
+    rc, out = sibling("sdw-gate", "--changes", "--full")
+    rows = []
+    for line in out.splitlines() if rc == 0 else []:
+        bits = line.split("\t", 2)
+        if len(bits) == 3:
+            rows.append(tuple(bits))
+    return rows
+
+
+def covers(path, prefixes):
+    return any(p == "." or path == p or path.startswith(p.rstrip("/") + "/") for p in prefixes)
+
+
+class Validator:
+    def __init__(self, ref="HEAD"):
+        self.ref = ref
+        self.repos = checkouts()
+        self.targets = {}
+
+    def target(self, top):
+        if top not in self.targets:
+            if self.ref == "WORKTREE":
+                self.targets[top] = worktree_tree(top)
+            else:
+                rc, tree = git(["rev-parse", "-q", "--verify", self.ref + "^{tree}"], top)
+                self.targets[top] = tree if rc == 0 else ""
+        return self.targets[top]
+
+    def check(self, repo, tree, paths):
+        top = self.repos.get(repo)
+        if not top:
+            return "invalid:repo-missing"
+        if not tree or git(["cat-file", "-e", tree + "^{tree}"], top)[0] != 0:
+            return "invalid:tree-missing"
+        target = self.target(top)
+        if not target:
+            return "invalid:no-" + self.ref.lower()
+        rc, out = git(["diff", "--name-only", "--no-renames", tree, target], top)
+        if rc != 0:
+            return "invalid:diff-failed"
+        for p in out.splitlines():
+            if p and not DOC.search(p) and covers(p, paths or ["."]):
+                return "invalid:changed:" + p
+        return "valid"
+
+    def stamp(self, stamp):
+        if not stamp:
+            return "invalid:no-stamp"
+        for r in stamp.get("repos", []):
+            v = self.check(r.get("repo", ""), r.get("tree", ""), stamp.get("paths") or ["."])
+            if v != "valid":
+                return v
+        return "valid" if stamp.get("repos") else "invalid:no-repos"
+
+
+def read_entries(wd):
+    f = wd / "evidence.jsonl"
+    rows = []
+    if f.is_file():
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
+def read_stamp(path):
+    if not path.is_file():
+        return None
+    first = path.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+    m = STAMP.match(first)
+    try:
+        return json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+
+def field(path, name):
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith(name + ":"):
+            return line[len(name) + 1:].strip()
+    return None
+
+
+def review_open(path):
+    """(S1, S2) open counts from review.md's 'Open:' line, or None."""
+    line = field(path, "Open")
+    if line is None:
+        return None
+    counts = dict(re.findall(r"(S[1-4])\s+(\d+)", line))
+    return int(counts.get("S1", -1)), int(counts.get("S2", -1))
+
+
+def bug_files(wd):
+    return sorted((wd / "bugs").glob("BUG-*.md")) if (wd / "bugs").is_dir() else []
+
+
+def pre_existing(f):
+    """Pre-existing holds only when it shows in an existing base capture and no AC names it."""
+    if (field(f, "Status") or "").lower() != "pre-existing":
+        return False
+    reg = (section(f.read_text(encoding="utf-8", errors="replace"), "Regression vs base") or "").strip()
+    if not re.match(r"(?i)no\b", reg) or re.search(r"(?i)\bAC[- ]?\d", field(f, "Source") or ""):
+        return False
+    return any((f.parent.parent / "shots" / n.rstrip(".")).is_file() for n in re.findall(r"shots/(base-[\w.-]+)", reg))
+
+
+def open_bugs(wd):
+    """(file, severity, status) of every bug not cleared by verified, wontfix with Decided-by:,
+    or a proven pre-existing."""
+    bugs = []
+    for f in bug_files(wd):
+        status = (field(f, "Status") or "").lower()
+        sev = (field(f, "Severity") or "").upper()[:2]
+        if status == "verified" or (status == "wontfix" and field(f, "Decided-by")) or pre_existing(f):
+            continue
+        if status == "pre-existing":
+            status = "pre-existing unproven"
+        elif status not in ("open", "fixed", "wontfix", ""):
+            status += " (unknown status)"
+        bugs.append((f.name, sev, status or "no status"))
+    return bugs
+
+
+def cells(line):
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+
+def read_cases(path):
+    """(header, rows by ID, charter count) of a cases.md table."""
+    header, rows, charters, in_ch = None, {}, 0, False
+    if not path.is_file():
+        return None, {}, 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("## "):
+            in_ch = line.strip() == "## Charters"
+        if in_ch and re.match(r"^###\s+C\d+", line):
+            charters += 1
+        if not line.startswith("|"):
+            continue
+        c = cells(line)
+        if header is None and c and c[0] == "ID":
+            header = c
+        elif header and c and re.match(r"^TC-\d+$", c[0]):
+            rows[c[0]] = {h: (c[i] if i < len(c) else "") for i, h in enumerate(header)}
+    return header, rows, charters
+
+
+def col(row, prefix):
+    for k, v in row.items():
+        if k.startswith(prefix):
+            return v
+    return ""
+
+
+def section(text, name):
+    m = re.search(r"^## " + re.escape(name) + r"[^\n]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    return None if m is None else m.group(1)
+
+
+def norm(v):
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def shot_errors(d):
+    host = lambda t: re.sub(r"(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?", "HOST", str(t))
+    errs = set()
+    for c in d.get("console") or []:
+        if c.get("type") == "error":
+            errs.add("console: " + host(c.get("text", "")))
+    for e in d.get("pageerror") or []:
+        errs.add("pageerror: " + host(e))
+    for r in d.get("requests") or []:
+        if isinstance(r.get("status"), int) and r["status"] >= 500:
+            errs.add(f"{r.get('method', '')} {urlsplit(r.get('url', '')).path} {r['status']}")
+    return errs
+
+
+def default_check_errors(wd):
+    """{route: new errors}: console errors, pageerrors and 5xx in unmocked captures that the
+    base capture of the same route (shots/base-*.json) does not show."""
+    shots = wd / "shots"
+    caps, base = {}, {}
+    for f in sorted(shots.rglob("*.json")) if shots.is_dir() else []:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or "console" not in d or "url" not in d:
+            continue
+        if d.get("mocked") or d.get("steps"):
+            continue
+        route = urlsplit(str(d.get("url"))).path or "/"
+        (base if f.name.startswith("base-") else caps).setdefault(route, set()).update(shot_errors(d))
+    out = {}
+    for route, errs in caps.items():
+        new = errs - base.get(route, set())
+        if new:
+            out[route] = sorted(new)
+    return out
+
+
+ENDPOINT = re.compile(r"^\s*-\s*(GET|POST|PUT|PATCH|DELETE)\s+(/\S*)", re.M)
+METHODS = r"GET|POST|PUT|PATCH|DELETE"
+NOT_GET = re.compile(rf"\b(?:{METHODS})\b|(?:^|\s)(?:-X|--request|-d|-F|--form|--data(?:-\w+)?)(?=[\s=]|$)")
+
+
+def names_endpoint(method, path, steps):
+    """Steps name this endpoint: its method with its path ({id} and :id match any segment); a bare path is a GET."""
+    p = re.sub(r"\\\{.*?\\\}|:\w+", lambda _: r"[^/\s|]+", re.escape(path)) + r"(?![\w/])"
+    gap = rf"(?:(?!\b(?:{METHODS})\b)[^\n|])*?"
+    for piece in re.split(r"<br\s*/?>|\s(?=\d+\.\s)", steps):
+        if re.search(rf"\b{method}\b{gap}{p}", piece):
+            return True
+        if method == "GET" and re.search(p, piece) and not NOT_GET.search(piece):
+            return True
+    return False
+
+
+def qa_verdict(wd, lane):
+    """(verdict, [blocking reasons], [known issues])."""
+    block, known = [], []
+    rep = wd / "qa-report.md"
+    stamp = read_stamp(rep)
+    if not rep.is_file() or not stamp:
+        return "NOT READY", ["no qa-report.md with a stamp line: QA has not run"], []
+    run_id = ((stamp.get("repos") or [{}])[0].get("tree") or "")[:7]
+    header, rows, charters = read_cases(wd / "cases.md")
+    if not rows:
+        return "NOT READY", ["cases.md has no TC rows"], []
+    if not any(h == "Run" for h in header or []):
+        block.append("cases.md has no Run column, so no result can be tied to this tree")
+    _, design, _ = read_cases(wd / ".cases.design.md")
+    if not design:
+        block.append("no design snapshot (.cases.design.md): cases never passed the design check")
+    result = {}
+    for tid, r in rows.items():
+        res = r.get("Result", "").upper().strip() or "NOT RUN"
+        if res == "PASS" and not r.get("Evidence", "").strip():
+            res = "NOT RUN"
+            block.append(f"{tid} PASS without evidence")
+        elif res == "PASS" and r.get("Run", "").strip()[:7] != run_id:
+            res = "NOT RUN"
+            known.append(f"{tid} carried from an earlier tree, not re-run")
+        result[tid] = res
+    for tid, d in design.items():
+        r = rows.get(tid)
+        if r is None:
+            block.append(f"{tid} deleted after design")
+            continue
+        for k in ("Source", "Steps", "Expected"):
+            if norm(col(d, k)) != norm(col(r, k)):
+                block.append(f"{tid} {k} changed after design")
+                result[tid] = "NOT RUN"
+                break
+    for tid, r in rows.items():
+        pri, res = r.get("Pri", "").upper(), result[tid]
+        if res == "PASS":
+            continue
+        if pri == "P1" or (lane == "RISKY" and res == "FAIL"):
+            block.append(f"{tid} ({pri or 'no Pri'}) {res}")
+        else:
+            known.append(f"{tid} ({pri or 'P2'}) {res}")
+    plan = (wd / "plan.md").read_text(encoding="utf-8", errors="replace") if (wd / "plan.md").is_file() else ""
+    acs = sorted(set(re.findall(r"^\|\s*(AC-\d+)\s*\|", plan, re.M)), key=lambda a: int(a[3:]))
+    for ac in acs:
+        pat = re.compile(r"(^|[^0-9A-Za-z-])" + re.escape(ac) + r"([^0-9]|$)")
+        if not any(result[t] == "PASS" and pat.search(r.get("Source", "")) for t, r in rows.items()):
+            block.append(f"{ac} has no passing case")
+    surfaces = section(plan, "Surfaces") or ""
+    for method, path in ENDPOINT.findall(surfaces):
+        hit = lambda tech: [t for t, r in rows.items() if tech in r.get("Technique", "").lower()
+                            and names_endpoint(method, path, r.get("Steps", ""))]
+        authz = hit("authz")
+        if not authz:
+            block.append(f"no authz case for {method} {path}")
+        elif not any(result[t] == "PASS" for t in authz):
+            block.append(f"authz for {method} {path} not passing")
+        if ("{" in path or "/:" in path) and not hit("idor"):
+            block.append(f"no idor case (another user's id) for {method} {path}")
+    for name, sev, status in open_bugs(wd):
+        (block if sev in ("S1", "S2") else known).append(f"bug {name} {sev} {status}")
+    text = rep.read_text(encoding="utf-8", errors="replace")
+    for sec in ("NOT RUN", "Test data created", "Questions for PO"):
+        if section(text, sec) is None:
+            block.append(f"qa-report.md has no ## {sec}")
+    for line in (section(text, "Questions for PO") or "").splitlines():
+        if re.search(r"blocks:\s*yes", line, re.I):
+            for ac in re.findall(r"AC-\d+", line):
+                block.append(f"{ac} unverifiable until answered: {line.strip()[:80]}")
+    for route, errs in default_check_errors(wd).items():
+        block.append(f"new on {route}: {errs[0]}" + (f" (+{len(errs) - 1})" if len(errs) > 1 else ""))
+    gaps = [g.strip() for g in (section(text, "Coverage gaps") or "").splitlines() if g.strip().lstrip("- ").strip()]
+    gaps = [g for g in gaps if not re.match(r"(?i)none\s*($|[—–:(-])", g.lstrip("- ").strip())]
+    for g in gaps:
+        (block if lane == "RISKY" else known).append("coverage gap: " + g.lstrip("- "))
+    if lane == "RISKY" and charters == 0:
+        block.append("RISKY needs at least one charter sheet under ## Charters in cases.md")
+    verdict = "NOT READY" if block else "READY WITH KNOWN ISSUES" if known else "READY"
+    return verdict, block, known
+
+
+def pre_existing_bugs(wd):
+    return [(f.name, (field(f, "Severity") or "").upper()[:2]) for f in bug_files(wd) if pre_existing(f)]
+
+
+def test_files(rows):
+    """[(repo, path)] of changed test files that still exist, via sdw-tamper --test-paths."""
+    by_co = {}
+    for co, repo, p in rows:
+        if os.path.isfile(os.path.join(co, p)):
+            by_co.setdefault((co, repo), []).append(p)
+    found, missing = [], False
+    for (co, repo), paths in by_co.items():
+        rc, out = sibling("sdw-tamper", "--test-paths", cwd=co, stdin="\n".join(paths) + "\n")
+        if rc == 127:
+            missing = True
+            continue
+        found += [(repo, p) for p in out.splitlines() if p]
+    return found, missing
+
+
+def newest(entries, kind, pred):
+    for e in reversed(entries):
+        if e.get("kind") == kind and pred(e):
+            yield e
+
+
+def cmd_stamp(args):
+    paths = opt_list(args, "--path") or ["."]
+    rows = change_set()
+    tops, seen = [], set()
+    for co, repo, _ in rows:
+        if repo not in seen:
+            seen.add(repo)
+            tops.append((repo, co))
+    if not tops:
+        top = toplevel()
+        if top:
+            tops = [(repo_name(top), top)]
+        else:
+            tops = [(name, co) for name, co in checkouts().items()]
+    if not tops:
+        die("no git repo here", 4)
+    repos = [{"repo": r, "head": head(co), "tree": worktree_tree(co)} for r, co in tops]
+    body = json.dumps({"repos": repos, "paths": paths, "ts": now()}, separators=(",", ":"))
+    print(f"<!-- sdw-stamp {body} -->")
+    return 0
+
+
+def cmd_add(args):
+    kind = opt(args, "--kind")
+    key = opt(args, "--key")
+    result = opt(args, "--result")
+    if not kind or not key or not result or kind not in KINDS:
+        die("add needs --kind (gate:full|redcheck|ui-diff) --key --result", 2)
+    top = toplevel()
+    if not top:
+        die("not in a git work tree", 4)
+    wd = workdir()
+    wd.mkdir(parents=True, exist_ok=True)
+    entry = {"v": 1, "ts": now(), "kind": kind, "key": key, "repo": repo_name(top), "head": head(top),
+             "tree": worktree_tree(top), "paths": opt_list(args, "--path") or ["."],
+             "result": result, "detail": (opt(args, "--detail") or "")[:200],
+             "artifacts": opt_list(args, "--artifact")}
+    line = json.dumps(entry, separators=(",", ":")) + "\n"
+    fd = os.open(str(wd / "evidence.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+    sys.stdout.write(line)
+    return 0
+
+
+def cmd_list(args):
+    ref = opt(args, "--valid-for")
+    kind = opt(args, "--kind")
+    wd = workdir()
+    v = Validator(ref or "HEAD")
+    rows = []
+    for e in read_entries(wd):
+        status = v.check(e.get("repo", ""), e.get("tree", ""), e.get("paths") or ["."])
+        rows.append((e.get("ts", ""), status, e.get("kind", "?"), e.get("key", "?"), str(e.get("result", "?"))))
+    for name, k in (("qa-report.md", "qa"), ("review.md", "review")):
+        st = read_stamp(wd / name)
+        if st is None and not (wd / name).is_file():
+            continue
+        if k == "qa":
+            result = field(wd / name, "Verdict") or "none"
+        else:
+            o = review_open(wd / name)
+            result = f"open:S1={o[0]},S2={o[1]}" if o else "open:unknown"
+        rows.append(((st or {}).get("ts", ""), v.stamp(st), k, name, result))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    for ts, status, k, key, result in rows:
+        if kind and k != kind:
+            continue
+        if ref and status != "valid":
+            continue
+        print(f"{status} {k} {key} {result.replace(' ', '_')} {ts}")
+    return 0
+
+
+def qa_next(wd):
+    """The QA command that can work now: retest only after a run with failures or open bugs."""
+    _, rows, _ = read_cases(wd / "cases.md")
+    failed = any(r.get("Result", "").upper() in ("FAIL", "BLOCKED") for r in rows.values())
+    if rows and (wd / "qa-report.md").is_file() and (failed or open_bugs(wd)):
+        return "/sdw:qa retest"
+    return "/sdw:qa"
+
+
+def review_counts(rv, raw, o):
+    """Open S1/S2: review.md's own count, or the reviewer's raw findings minus the ones the user
+    marked justified in review.md, whichever is higher."""
+    rtext = raw.read_text(encoding="utf-8", errors="replace")
+    mtext = rv.read_text(encoding="utf-8", errors="replace")
+    res = []
+    for i, sev in enumerate(("S1", "S2")):
+        n_raw = len(re.findall(r"^\s*-\s*\[" + sev + r"\]", rtext, re.M))
+        n_just = len(re.findall(r"^\s*-\s*\[" + sev + r"\].*\(justified", mtext, re.M))
+        res.append(max(o[i], n_raw - n_just))
+    return tuple(res)
+
+
+def cmd_qa_verdict(args):
+    wd = workdir()
+    lane = lane_of(wd, args)
+    if lane == "TRIVIAL":
+        lane = "STANDARD"
+    verdict, block, known = qa_verdict(wd, lane)
+    print(f"Verdict: {verdict}")
+    for r in block:
+        print(f"- blocks: {r}")
+    for r in known:
+        print(f"- known: {r}")
+    for name, sev in pre_existing_bugs(wd):
+        print(f"- pre-existing: bug {name} {sev}")
+    if "--write" in args:
+        rep = wd / "qa-report.md"
+        if rep.is_file():
+            text = rep.read_text(encoding="utf-8", errors="replace")
+            new, n = re.subn(r"^Verdict:.*$", f"Verdict: {verdict}", text, count=1, flags=re.M)
+            if n:
+                rep.write_text(new, encoding="utf-8")
+    return 1 if verdict == "NOT READY" else 0
+
+
+def lane_of(wd, args):
+    lane = opt(args, "--lane")
+    if lane:
+        return lane.upper()
+    plan = wd / "plan.md"
+    if not plan.is_file():
+        return "TRIVIAL"
+    m = re.search(r"^Lane:\s*([A-Z]+)", plan.read_text(encoding="utf-8", errors="replace"), re.M)
+    return m.group(1) if m else "STANDARD"
+
+
+def gate_keys():
+    try:
+        out = subprocess.run([str(HERE / "sdw-gate"), "--dry-run", "--full"], capture_output=True, text=True)
+    except OSError:
+        return None, "sdw-gate missing"
+    if out.returncode == 3:
+        sys.exit(3)
+    if out.returncode != 0:
+        return None, (out.stderr.strip().splitlines() or ["sdw-gate failed"])[-1]
+    keys = []
+    for line in out.stdout.splitlines():
+        k = line.split("\t")[0]
+        if k and k not in keys:
+            keys.append(k)
+    return keys, ""
+
+
+def cmd_check(args):
+    wd = workdir()
+    lane = lane_of(wd, args)
+    entries = read_entries(wd)
+    v = Validator("HEAD")
+    out = []
+    keys, err = gate_keys()
+    if keys is None:
+        out.append(("FAIL", "gates", err))
+    for k in keys or []:
+        status = "no run"
+        for e in newest(entries, "gate:full", lambda e: e.get("key") == k):
+            valid = v.check(e.get("repo", ""), e.get("tree", ""), e.get("paths") or ["."])
+            if valid == "valid" and e.get("result") == "pass":
+                status = "ok"
+                break
+            if status == "no run":
+                status = f"{e.get('result')}, {valid}"
+        out.append(("PASS", f"gate {k}", "pass") if status == "ok" else ("FAIL", f"gate {k}", status))
+    tests, missing = test_files(change_set())
+    if missing:
+        out.append(("WARN", "tests", "sdw-tamper missing; test files not checked"))
+    for repo, p in tests:
+        got = [e.get("result") for e in newest(entries, "redcheck",
+                                                lambda e: e.get("repo") == repo and p in (e.get("paths") or []))
+               if v.check(repo, e.get("tree", ""), e.get("paths") or ["."]) == "valid"]
+        cls = next((r for r in got if r in PROVEN), got[0] if got else None)
+        if cls in PROVEN:
+            out.append(("PASS", f"proven {p}", cls))
+        else:
+            out.append(("WARN", f"NOT PROVEN {p}", cls or "no redcheck"))
+    if lane in ("STANDARD", "RISKY", "BUG"):
+        qa = wd / "qa-report.md"
+        valid = v.stamp(read_stamp(qa)) if qa.is_file() else "missing"
+        verdict, block, _ = qa_verdict(wd, lane)
+        written = field(qa, "Verdict")
+        if valid == "valid" and verdict in READY:
+            out.append(("PASS", "qa", verdict))
+            if written != verdict:
+                out.append(("WARN", "qa", f"qa-report.md says {written or 'nothing'}; computed {verdict}"))
+        else:
+            out.append(("FAIL", "qa", f"{verdict if valid == 'valid' else valid}"
+                        f"{'; ' + block[0] if block and valid == 'valid' else ''}; type {qa_next(wd)}"))
+        rv = wd / "review.md"
+        valid = v.stamp(read_stamp(rv)) if rv.is_file() else "missing"
+        raw = wd / "review-raw.md"
+        rvalid = v.stamp(read_stamp(raw)) if raw.is_file() else "missing"
+        o = review_open(rv)
+        if o and rvalid == "valid":
+            o = review_counts(rv, raw, o)
+        if valid == "valid" and rvalid == "valid" and o == (0, 0):
+            out.append(("PASS", "review", "no open S1/S2"))
+        elif valid == "missing" and rvalid == "missing":
+            out.append(("FAIL", "review", "no review yet; type /sdw:review"))
+        else:
+            what = f"open S1 {o[0]}, S2 {o[1]}" if o else "no Open: line"
+            if rvalid != "valid":
+                what += f", raw reviewer output {rvalid}"
+            out.append(("FAIL", "review", f"{what}, review.md {valid}; type /sdw:review"))
+    for name, sev, status in open_bugs(wd):
+        if sev in ("S1", "S2"):
+            out.append(("FAIL", f"bug {name}", f"{status} {sev}" + ("; retest sets verified" if status == "fixed" else "")))
+    for name, sev in pre_existing_bugs(wd):
+        if sev in ("S1", "S2"):
+            out.append(("WARN", f"bug {name}", f"pre-existing {sev} (not blocking)"))
+    for level, what, detail in out:
+        print(f"{level} {what}: {detail}")
+    blocked = any(level == "FAIL" for level, _, _ in out)
+    print(f"RESULT: {'blocked' if blocked else 'ok'}")
+    return 1 if blocked else 0
+
+
+def cmd_pr_lines(args):
+    wd = workdir()
+    entries = read_entries(wd)
+    v = Validator("HEAD")
+    valid = [e for e in entries if v.check(e.get("repo", ""), e.get("tree", ""), e.get("paths") or ["."]) == "valid"]
+    lines = []
+    tests, _ = test_files(change_set())
+    proven = mutated = 0
+    for repo, p in tests:
+        got = {e.get("result") for e in valid if e.get("kind") == "redcheck" and e.get("repo") == repo
+               and p in (e.get("paths") or [])}
+        if "RED(assertion)" in got:
+            proven += 1
+        elif "RED(mutation)" in got:
+            mutated += 1
+    if tests:
+        lines.append(f"Tests added: {len(tests)} ({proven} proven failing before the change"
+                     + (f", {mutated} by breaking the new code)" if mutated else ")"))
+    cmds = []
+    for e in valid:
+        if e.get("kind") == "gate:full" and e.get("result") == "pass" and e.get("detail") and e["detail"] not in cmds:
+            cmds.append(e["detail"])
+    if cmds:
+        lines.append("Checks run: " + "; ".join(f"`{c}`" for c in cmds))
+    ui = []
+    for e in valid:
+        if e.get("kind") == "ui-diff" and e.get("key") not in ui:
+            ui.append(e.get("key"))
+    if ui:
+        lines.append("UI compared: " + ", ".join(ui))
+    not_run = 0
+    qa = wd / "qa-report.md"
+    if qa.is_file() and v.stamp(read_stamp(qa)) == "valid":
+        cases = wd / "cases.md"
+        n = 0
+        if cases.is_file():
+            for row in cases.read_text(encoding="utf-8", errors="replace").splitlines():
+                if re.match(r"^\|\s*TC-\d+", row):
+                    n += 1
+                    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                    if len(cells) >= 11 and cells[10] == "NOT RUN":
+                        not_run += 1
+        verdict = qa_verdict(wd, lane_of(wd, []))[0].lower()
+        lines.append(f"QA: {n} cases, {verdict}")
+    gaps = []
+    if tests and len(tests) - proven:
+        gaps.append(f"{len(tests) - proven} tests not proven failing first")
+    if not_run:
+        gaps.append(f"{not_run} cases not run")
+    if gaps:
+        lines.append("Not covered: " + ", ".join(gaps))
+    for line in lines[:8]:
+        print(line)
+    return 0
+
+
+def opt(args, name):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def opt_list(args, name):
+    return [args[i + 1] for i, a in enumerate(args) if a == name and i + 1 < len(args)]
+
+
+KNOWN = {"stamp": {"--path"}, "add": {"--kind", "--key", "--result", "--path", "--detail", "--artifact"},
+         "list": {"--valid-for", "--kind"}, "check": {"--lane"}, "qa-verdict": {"--lane", "--write"},
+         "pr-lines": set()}
+FLAGS = {"--write"}
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    sub, rest = argv[0], argv[1:]
+    if sub not in KNOWN:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    i = 0
+    while i < len(rest):
+        if rest[i] in FLAGS and rest[i] in KNOWN[sub]:
+            i += 1
+            continue
+        if rest[i] not in KNOWN[sub] or i + 1 >= len(rest):
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        i += 2
+    return {"stamp": cmd_stamp, "add": cmd_add, "list": cmd_list, "check": cmd_check,
+            "qa-verdict": cmd_qa_verdict, "pr-lines": cmd_pr_lines}[sub](rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

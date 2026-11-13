@@ -1,0 +1,9 @@
+#!/bin/sh
+# aim-pick [role] [--exclude VENDOR] [--dir PATH]: show the priority chain and the tool to use.
+src=$0
+while [ -L "$src" ]; do
+  dir=$(cd "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+exec "$(cd "$(dirname "$src")" && pwd)/ai-quota" --pick "$@"

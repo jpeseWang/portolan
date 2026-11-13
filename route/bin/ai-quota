@@ -1,0 +1,11 @@
+#!/bin/sh
+# ai-quota from any shell (bash, zsh, fish): follows symlinks to find the clone, then runs ai-quota.py.
+src=$0
+while [ -L "$src" ]; do
+  dir=$(cd "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+here=$(cd "$(dirname "$src")/.." && pwd)
+command -v python3 >/dev/null 2>&1 || { echo "ai-quota: python3 not found" >&2; exit 4; }
+exec python3 -I -B "$here/ai-quota.py" "$@"

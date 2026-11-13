@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# Fast and full gates from <projdir>/.sdw/gates, keyed by <repo>:<prefix>; see docs/internals.md §2.5, §3.4.
+set -u
+
+usage() {
+  cat <<'EOF'
+usage: sdw-gate --fingerprint            fingerprint of the current changes ("" when none)
+       sdw-gate --dry-run [--full]       print "<key>\t<dir>\t<cmd>" that would run
+       sdw-gate --fast                   run fast gates for working-tree changes vs HEAD
+       sdw-gate --full [--keys k1,k2]    run full gates for branch changes, write evidence
+       sdw-gate --check                  "fresh <fp>" when the fingerprint passed the fast gate
+       sdw-gate --write-baseline KEY [--full]   store KEY's pre-existing diagnostics
+       sdw-gate --list                   print gate keys
+       sdw-gate --changes [--full]       print "<checkout>\t<repo>\t<path>" of the change set
+env:   SDW_GATE_TIMEOUT  whole-run budget in seconds (default 280)
+exit: 0 ok/green/fresh, 1 red/stale, 2 usage, 3 not onboarded, 4 gates file missing or unparsable
+EOF
+}
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+MODE="" FULL=0 KEYS="" WB_KEY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --fingerprint) MODE=fingerprint ;;
+    --dry-run) MODE=dry-run ;;
+    --fast) MODE=fast ;;
+    --full) FULL=1; [ -z "$MODE" ] && MODE=full ;;
+    --keys) [ $# -gt 1 ] || { usage >&2; exit 2; }; KEYS=$2; shift ;;
+    --check) MODE=check ;;
+    --list) MODE=list ;;
+    --changes) MODE=changes ;;
+    --write-baseline) [ $# -gt 1 ] || { usage >&2; exit 2; }; MODE=write-baseline; WB_KEY=$2; shift ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+[ -n "$MODE" ] || { usage >&2; exit 2; }
+[ "$MODE" = full ] && FULL=1
+[ "$MODE" = fast ] && FULL=0
+
+P=$("$here/sdw-workdir" --projdir) || exit 3
+GATES="$P/.sdw/gates"
+STATE="$P/.sdw/state"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/sdw-gate.XXXXXX") || exit 4
+trap 'rm -rf "$TMP"' EXIT
+export GIT_OPTIONAL_LOCKS=0
+
+# ---------- gates file ----------
+G_KEY=() G_REPO=() G_PREFIX=() G_FAST=() G_FULL=() D_LEFT=() D_RIGHT=()
+NG=0 ND=0
+
+valid_key() {
+  printf '%s\n' "$1" | grep -Eq '^[^:[:space:]|]+:[^[:space:]|]+$' || return 1
+  local p=${1#*:}
+  [ "$p" = . ] && return 0
+  case "$p" in /*|*/|./*|*/./*|*/.|..|../*|*/../*|*/..) return 1 ;; esac
+  return 0
+}
+
+parse_gates() {
+  [ -f "$GATES" ] || { echo "sdw-gate: no gates file: $GATES" >&2; exit 4; }
+  local n=0 line t key rest fast full r
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    t=${line#"${line%%[![:space:]]*}"}
+    t=${t%"${t##*[![:space:]]}"}
+    case "$t" in ''|'#'*) continue ;; esac
+    case "$t" in
+      deps:*)
+        rest=${t#deps:}
+        key=${rest%% -> *}
+        r=${rest#*" -> "}
+        key=${key#"${key%%[![:space:]]*}"}
+        if [ "$r" = "$rest" ] || ! valid_key "$key"; then
+          echo "sdw-gate: .sdw/gates:$n: cannot parse: $line" >&2; exit 4
+        fi
+        for k in $r; do valid_key "$k" || { echo "sdw-gate: .sdw/gates:$n: bad key: $k" >&2; exit 4; }; done
+        D_LEFT[ND]=$key D_RIGHT[ND]=$r ND=$((ND + 1))
+        continue ;;
+    esac
+    key=${t%% | *}
+    rest=${t#"$key"}
+    fast="" full=""
+    case "$rest" in
+      " | fast: "*)
+        rest=${rest#" | fast: "}
+        fast=${rest%% | full: *}
+        case "$rest" in *" | full: "*) full=${rest#*" | full: "} ;; esac ;;
+      " | full: "*) full=${rest#" | full: "} ;;
+      "") ;;
+      *) echo "sdw-gate: .sdw/gates:$n: cannot parse: $line" >&2; exit 4 ;;
+    esac
+    case "$fast$full" in *" | fast: "*|*" | full: "*)
+      echo "sdw-gate: .sdw/gates:$n: separators out of order: $line" >&2; exit 4 ;;
+    esac
+    valid_key "$key" || { echo "sdw-gate: .sdw/gates:$n: bad key: $key" >&2; exit 4; }
+    G_KEY[NG]=$key G_REPO[NG]=${key%%:*} G_PREFIX[NG]=${key#*:} G_FAST[NG]=$fast G_FULL[NG]=$full
+    NG=$((NG + 1))
+  done < "$GATES"
+}
+
+# ---------- change set ----------
+repo_name() {
+  local common
+  common=$(cd "$1" && cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P) || { basename "$1"; return; }
+  if [ "$(basename "$common")" = .git ]; then basename "$(dirname "$common")"; else basename "$1"; fi
+}
+
+# "<checkout>\t<repo>" for the $PWD work tree first, then every repo under projdir; one checkout per
+# repo, so a sibling worktree never gates the main checkout's (another agent's) changes.
+list_checkouts() {
+  local top name seen=" "
+  {
+    top=$(git rev-parse --show-toplevel 2>/dev/null) && (cd "$top" && pwd -P)
+    "$here/sdw-workdir" --repos 2>/dev/null
+  } | while IFS= read -r top; do
+    [ -n "$top" ] || continue
+    name=$(repo_name "$top")
+    case "$seen" in *" $name "*) continue ;; esac
+    seen="$seen$name "
+    printf '%s\t%s\n' "$top" "$name"
+  done
+}
+
+base_ref() {
+  local b
+  b=$("$here/sdw-cfg" BASE_BRANCH 2>/dev/null) || b=main
+  [ -n "$b" ] || b=main
+  git merge-base HEAD "origin/$b" 2>/dev/null && return 0
+  git merge-base HEAD "$b" 2>/dev/null && return 0
+  echo "sdw-gate: no merge-base with $b in $(basename "$PWD"); using HEAD" >&2
+  echo HEAD
+}
+
+doc_filter() { grep -Ev '\.(md|mdx|txt)$|^docs/|^local-docs/|^\.sdw/' || true; }
+
+changed_in() {
+  (
+    cd "$1" || exit 0
+    # NUL-separated so git never C-quotes a path; a path holding a newline is dropped.
+    {
+      if git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        if [ "$2" = 1 ]; then
+          git diff --name-only -z --no-renames "$(base_ref)" --
+        else
+          git diff --name-only -z --no-renames HEAD --
+        fi
+      else
+        git ls-files -z
+      fi
+      git ls-files -z --others --exclude-standard
+    } 2>/dev/null | perl -0ne 'chomp; print "$_\n" unless /\n/' | LC_ALL=C sort -u | doc_filter
+  )
+}
+
+CHECKOUTS="$TMP/checkouts" CHANGES="$TMP/changes"
+build_changes() {
+  list_checkouts > "$CHECKOUTS"
+  : > "$CHANGES"
+  local co repo p
+  while IFS="$(printf '\t')" read -r co repo; do
+    changed_in "$co" "$1" | while IFS= read -r p; do
+      [ -n "$p" ] && printf '%s\t%s\t%s\n' "$co" "$repo" "$p"
+    done >> "$CHANGES"
+  done < "$CHECKOUTS"
+}
+
+fingerprint() {
+  build_changes 0
+  [ -s "$CHANGES" ] || return 0
+  local co repo p sha n=0
+  {
+    cut -f1,2 "$CHANGES" | LC_ALL=C sort -u | while IFS="$(printf '\t')" read -r co repo; do
+      n=$((n + 1))
+      sha=$(cd "$co" && git rev-parse -q --verify HEAD 2>/dev/null) || sha=unborn
+      printf '%s HEAD %s\n' "$repo" "$sha"
+      : > "$TMP/fp-files.$n"
+      awk -F'\t' -v c="$co" '$1 == c { print substr($0, length($1) + length($2) + 3) }' "$CHANGES" | while IFS= read -r p; do
+        if [ -f "$co/$p" ]; then printf '%s\n' "$p" >> "$TMP/fp-files.$n"
+        elif [ -e "$co/$p" ]; then printf '%s:%s dir\n' "$repo" "$p"
+        else printf '%s:%s deleted\n' "$repo" "$p"
+        fi
+      done
+      if [ -s "$TMP/fp-files.$n" ]; then
+        (cd "$co" && git hash-object --stdin-paths < "$TMP/fp-files.$n") > "$TMP/fp-hash.$n" 2>/dev/null
+        awk -v r="$repo" 'NR == FNR { h[FNR] = $0; next } { print r ":" $0 " " (FNR in h ? h[FNR] : "unreadable") }' \
+          "$TMP/fp-hash.$n" "$TMP/fp-files.$n"
+      fi
+    done
+  } | LC_ALL=C sort | git hash-object --stdin
+}
+
+# ---------- selection ----------
+# Prints "<gate index>\t<checkout>" for every gate the change set selects.
+select_gates() {
+  local i j k co repo p sel="$TMP/sel"
+  : > "$sel"
+  while IFS="$(printf '\t')" read -r co repo p; do
+    i=0
+    while [ $i -lt $NG ]; do
+      if [ "${G_REPO[i]}" = "$repo" ]; then
+        case "${G_PREFIX[i]}" in
+          .) printf '%s\t%s\n' "$i" "$co" ;;
+          *) if [ "$p" = "${G_PREFIX[i]}" ] || [ "${p#"${G_PREFIX[i]}/"}" != "$p" ]; then printf '%s\t%s\n' "$i" "$co"; fi ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+  done < "$CHANGES" | LC_ALL=C sort -u > "$sel"
+  cp "$sel" "$TMP/direct"
+  while IFS="$(printf '\t')" read -r i co; do
+    j=0
+    while [ $j -lt $ND ]; do
+      if [ "${D_LEFT[j]}" = "${G_KEY[i]}" ]; then
+        for k in ${D_RIGHT[j]}; do
+          add_key "$k" "$co" >> "$sel"
+        done
+      fi
+      j=$((j + 1))
+    done
+  done < "$TMP/direct"
+  LC_ALL=C sort -u "$sel"
+}
+
+# "<index>\t<checkout>" for key $1, preferring checkout $2 when it holds the key's repo.
+add_key() {
+  local i=0 co="" r
+  r=${1%%:*}
+  if [ -n "${2:-}" ] && [ "$(awk -F'\t' -v c="$2" '$1 == c { print $2; exit }' "$CHECKOUTS")" = "$r" ]; then
+    co=$2
+  else
+    co=$(awk -F'\t' -v r="$r" '$2 == r { print $1; exit }' "$CHECKOUTS")
+  fi
+  [ -n "$co" ] || { echo "sdw-gate: no checkout of repo $r for $1" >&2; return 0; }
+  while [ $i -lt $NG ]; do
+    [ "${G_KEY[i]}" = "$1" ] && printf '%s\t%s\n' "$i" "$co"
+    i=$((i + 1))
+  done
+}
+
+key_exists() {
+  local i=0
+  while [ $i -lt $NG ]; do [ "${G_KEY[i]}" = "$1" ] && return 0; i=$((i + 1)); done
+  return 1
+}
+
+# Lines "<index>\t<checkout>\t<dir>\t<cmd>" to run, in gates-file order.
+plan() {
+  local sel i co cmd dir k first
+  if [ -n "$KEYS" ]; then
+    list_checkouts > "$CHECKOUTS"
+    : > "$TMP/plan-sel"
+    for k in $(printf '%s' "$KEYS" | tr ',' ' '); do
+      key_exists "$k" || { echo "sdw-gate: unknown key: $k" >&2; exit 2; }
+      first=$(awk -F'\t' -v r="${k%%:*}" '$2 == r { print $1; exit }' "$CHANGES" 2>/dev/null)
+      add_key "$k" "$first" >> "$TMP/plan-sel"
+    done
+    sel=$(LC_ALL=C sort -u "$TMP/plan-sel")
+  else
+    build_changes "$FULL"
+    sel=$(select_gates)
+  fi
+  printf '%s\n' "$sel" | LC_ALL=C sort -t "$(printf '\t')" -k1,1n | while IFS="$(printf '\t')" read -r i co; do
+    [ -n "$i" ] || continue
+    if [ "$FULL" = 1 ]; then cmd=${G_FULL[i]}; else cmd=${G_FAST[i]}; fi
+    [ -n "$cmd" ] || continue
+    if [ "${G_PREFIX[i]}" = . ]; then dir=$co; else dir="$co/${G_PREFIX[i]}"; fi
+    printf '%s\t%s\t%s\t%s\n' "$i" "$co" "$dir" "$cmd"
+  done
+}
+
+# ---------- running ----------
+gslug() { printf '%s' "$1" | sed -e 's#:\.$#:_all#' -e 's#:#--#' -e 's#/#__#g'; }
+
+normalise() {
+  perl -ne 'BEGIN { $r = shift @ARGV } s/\e\[[0-9;]*[A-Za-z]//g;
+    next unless /(error|warning) (TS|CS|MSB|NU|CA|IDE|BC)[0-9]+/ || /^[^:]+:[0-9]+:[0-9]+: .*\[(Error|Warning)\//;
+    s/\Q$r\E\/?//g; s{(?<![^\s(\x27"])/[^\s:()\x27"]*?/node_modules/}{node_modules/}g; s/\(\d+,\d+\)//g; s/:\d+:\d+//g; s/\s+$//; print "$_\n"' "$1" | LC_ALL=C sort -u
+}
+
+timed() {
+  perl -e 'my $t = shift; my $pid = fork(); die "fork failed\n" unless defined $pid;
+    if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; exit 124 };
+    alarm $t; waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+
+START=$(date +%s)
+BUDGET=${SDW_GATE_TIMEOUT:-280}
+
+# run_one <checkout> <dir> <cmd> <key> <outfile> -> prints pass|fail|timeout
+run_one() {
+  local co=$1 dir=$2 cmd=$3 key=$4 out=$5 left rc base
+  left=$((BUDGET - ($(date +%s) - START)))
+  if [ ! -d "$dir" ]; then echo "gate dir missing: $dir" > "$out"; echo fail; return; fi
+  if [ "$left" -le 0 ]; then echo "timeout (budget ${BUDGET}s spent before this gate)" > "$out"; echo timeout; return; fi
+  (
+    cd "$dir" || exit 1
+    if [ -f "$P/.sdw/env.sh" ]; then . "$P/.sdw/env.sh"; fi
+    timed "$left" bash -c "$cmd"
+  ) > "$out" 2>&1 < /dev/null
+  rc=$?
+  if [ $rc = 124 ]; then echo "timeout after ${left}s" >> "$out"; echo timeout; return; fi
+  [ $rc = 0 ] && { echo pass; return; }
+  base="$STATE/gate-baseline/$(gslug "$key").txt"
+  if [ -f "$base" ]; then
+    normalise "$co" < "$out" > "$out.diag"
+    if [ -s "$out.diag" ] && [ -z "$(LC_ALL=C comm -23 "$out.diag" <(LC_ALL=C sort -u "$base"))" ]; then
+      echo "pass (all diagnostics pre-existing, see $base)" >> "$out"; echo pass; return
+    fi
+  fi
+  echo fail
+}
+
+# Covered paths for evidence: the key's prefix plus every same-repo deps: left that selects it.
+covered() {
+  local i=$1 j k lk
+  printf '%s\n' "${G_PREFIX[i]}"
+  j=0
+  while [ $j -lt $ND ]; do
+    for k in ${D_RIGHT[j]}; do
+      lk=${D_LEFT[j]}
+      [ "$k" = "${G_KEY[i]}" ] && [ "${lk%%:*}" = "${G_REPO[i]}" ] && printf '%s\n' "${lk#*:}"
+    done
+    j=$((j + 1))
+  done
+}
+
+# Outside every checkout only main checkouts are gated; name the linked worktrees that are skipped.
+note_ungated() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 && return 0
+  local co n
+  "$here/sdw-workdir" --repos 2>/dev/null | while IFS= read -r co; do
+    [ -n "$co" ] || continue
+    n=$(cd "$co" && git worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
+    if [ "${n:-1}" -gt 1 ]; then
+      echo "sdw-gate: note: $(basename "$co") has $((n - 1)) linked worktree(s) not gated from here; cd into the one you changed" >&2
+    fi
+  done
+  return 0
+}
+
+run_plan() {
+  note_ungated
+  local planf="$TMP/plan" i co dir cmd res n=0 red=0 keys="" redkeys="" out args p wd
+  plan > "$planf" || exit $?
+  wd=$("$here/sdw-workdir" 2>/dev/null) || wd=""
+  : > "$TMP/report"
+  while IFS="$(printf '\t')" read -r i co dir cmd; do
+    [ -n "$i" ] || continue
+    n=$((n + 1)); out="$TMP/out.$n"
+    res=$(run_one "$co" "$dir" "$cmd" "${G_KEY[i]}" "$out")
+    keys="${keys:+$keys,}${G_KEY[i]}"
+    if [ "$res" != pass ]; then
+      red=1; redkeys="${redkeys:+$redkeys,}${G_KEY[i]}"
+      { printf -- '--- %s (%s): %s\n' "${G_KEY[i]}" "$dir" "$cmd"; tail -n 40 "$out"; } >> "$TMP/report"
+    fi
+    if [ "$FULL" = 1 ]; then
+      [ "$res" = pass ] || [ "$res" = timeout ] || res=fail
+      printf '%s %s (%s)\n' "$res" "${G_KEY[i]}" "$dir"
+      args=()
+      while IFS= read -r p; do args+=(--path "$p"); done <<EOF
+$(covered "$i" | LC_ALL=C sort -u)
+EOF
+      (cd "$co" && SDW_WD="$wd" "$here/sdw-evidence" add --kind gate:full --key "${G_KEY[i]}" --result "$res" \
+        "${args[@]}" --detail "$(printf '%s' "$cmd" | cut -c1-200)" >/dev/null) \
+        || echo "sdw-gate: could not record evidence for ${G_KEY[i]}" >&2
+    fi
+  done < "$planf"
+  if [ "$red" = 1 ]; then
+    [ "$FULL" = 1 ] || echo "red $redkeys"
+    cat "$TMP/report"
+    return 1
+  fi
+  if [ "$FULL" = 0 ]; then
+    local fp
+    fp=$(fingerprint)
+    if [ -n "$fp" ]; then
+      mkdir -p "$STATE"
+      { [ -f "$STATE/gate-stamps" ] && tail -n 49 "$STATE/gate-stamps"; printf '%s %s\n' "$fp" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > "$TMP/stamps"
+      cat "$TMP/stamps" > "$STATE/gate-stamps"
+    fi
+    echo "green $keys"
+  fi
+  return 0
+}
+
+case "$MODE" in
+  fingerprint) fingerprint ;;
+  changes) build_changes "$FULL"; cat "$CHANGES" ;;
+  list) parse_gates; i=0; while [ $i -lt $NG ]; do printf '%s\n' "${G_KEY[i]}"; i=$((i + 1)); done ;;
+  dry-run)
+    parse_gates
+    plan > "$TMP/plan" || exit $?
+    while IFS="$(printf '\t')" read -r i co dir cmd; do
+      [ -n "$i" ] && printf '%s\t%s\t%s\n' "${G_KEY[i]}" "$dir" "$cmd"
+    done < "$TMP/plan" ;;
+  check)
+    fp=$(fingerprint)
+    if [ -z "$fp" ]; then echo "fresh (no changes)"; exit 0; fi
+    if [ -f "$STATE/gate-stamps" ] && grep -q "^$fp " "$STATE/gate-stamps"; then echo "fresh $fp"; exit 0; fi
+    echo stale; exit 1 ;;
+  fast|full) parse_gates; run_plan; exit $? ;;
+  write-baseline)
+    parse_gates
+    key_exists "$WB_KEY" || { echo "sdw-gate: unknown key: $WB_KEY" >&2; exit 2; }
+    list_checkouts > "$CHECKOUTS"
+    top=$(git rev-parse --show-toplevel 2>/dev/null) && top=$(cd "$top" && pwd -P) || top=""
+    line=$(add_key "$WB_KEY" "$top" | head -n 1)
+    [ -n "$line" ] || exit 4
+    i=${line%%"$(printf '\t')"*}; co=${line#*"$(printf '\t')"}
+    if [ "$FULL" = 1 ]; then cmd=${G_FULL[i]}; else cmd=${G_FAST[i]}; fi
+    [ -n "$cmd" ] || { echo "sdw-gate: $WB_KEY has no $([ "$FULL" = 1 ] && echo full || echo fast) command" >&2; exit 4; }
+    if [ "${G_PREFIX[i]}" = . ]; then dir=$co; else dir="$co/${G_PREFIX[i]}"; fi
+    [ -d "$dir" ] || { echo "sdw-gate: gate dir missing: $dir" >&2; exit 4; }
+    ( cd "$dir" && { [ -f "$P/.sdw/env.sh" ] && . "$P/.sdw/env.sh"; true; } && timed "$BUDGET" bash -c "$cmd" ) > "$TMP/wb" 2>&1 < /dev/null
+    rc=$?
+    mkdir -p "$STATE/gate-baseline"
+    f="$STATE/gate-baseline/$(gslug "$WB_KEY").txt"
+    normalise "$co" < "$TMP/wb" > "$f"
+    echo "wrote $f ($(grep -c . "$f" | tr -d ' ') diagnostics, command exit $rc)" ;;
+esac

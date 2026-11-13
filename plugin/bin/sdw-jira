@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+USAGE = """usage:
+  sdw-jira GET|POST|PUT <path> [@payload.json | @-]
+  sdw-jira myself
+  sdw-jira issue <KEY> [--fields f,f] [--text]
+  sdw-jira transitions <KEY>
+  sdw-jira transition <KEY> <id> [--dry-run]
+  sdw-jira search <jql> [--fields f,f] [--max N] [--brief]
+  sdw-jira sprint [--project P]
+  sdw-jira worklog list <KEY> [--since YYYY-MM-DD|epoch-ms] [--mine]
+  sdw-jira worklog mine <YYYY-MM-DD>
+  sdw-jira worklog add <KEY> --started ISO|now --duration 1h30m
+                       [--comment TEXT | --comment-file F] [--dry-run]
+  sdw-jira create --type T --summary S [--project P] [--description-file F]
+                  [--assignee me|ID] [--sprint ID] [--label L]... [--dry-run]
+  sdw-jira render [--flavor cloud|dc] < text
+  sdw-jira attachment <id> --out FILE     FILE under <projdir>/.sdw/work/ or the temp dir; never overwritten
+
+Paths not starting /rest/ get /rest/api/3 (cloud) or /rest/api/2 (dc) prepended.
+Text inputs are light markdown (#, -, 1., ```), sent as ADF (cloud) or wiki (dc).
+Config (.sdw/config.env): JIRA_BASE_URL JIRA_FLAVOR JIRA_AUTH JIRA_EMAIL JIRA_PROJECT
+JIRA_AC_FIELD JIRA_SPRINT_FIELD. Token: Keychain service sdw:jira:<JIRA_BASE_URL>.
+Body on stdout, "HTTP <code>" on stderr. --dry-run prints the request, sends nothing.
+Exit: 0 2xx, 1 non-2xx or no response, 2 usage, 4 config/token/tool missing, 5 refused.
+"""
+
+HERE = os.path.realpath(os.path.dirname(os.path.abspath(sys.argv[0])))
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+class Exit(Exception):
+    def __init__(self, code, msg=""):
+        Exception.__init__(self, msg)
+        self.code = code
+        self.msg = msg
+
+
+def err(msg):
+    sys.stderr.write("sdw-jira: %s\n" % msg)
+
+
+def usage(msg):
+    raise Exit(2, "%s (sdw-jira -h)" % msg)
+
+
+# ---------- config and auth ----------
+
+def _cfg_run(args):
+    exe = os.path.join(HERE, "sdw-cfg")
+    if not os.access(exe, os.X_OK):
+        raise Exit(4, "sdw-cfg missing beside sdw-jira")
+    return subprocess.run([exe] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def cfg(key):
+    r = _cfg_run([key])
+    if r.returncode != 0:
+        raise Exit(4, "sdw-cfg %s failed (%d)" % (key, r.returncode))
+    return r.stdout.decode().strip()
+
+
+def cfg_has(key):
+    return _cfg_run(["--has", key]).returncode == 0
+
+
+class Conf(object):
+    def __init__(self, flavor=None):
+        self.flavor = (flavor or cfg("JIRA_FLAVOR") or "cloud").lower()
+        if self.flavor not in ("cloud", "dc"):
+            raise Exit(4, "JIRA_FLAVOR must be cloud or dc, not %r" % self.flavor)
+        self._base = None
+
+    @property
+    def cloud(self):
+        return self.flavor == "cloud"
+
+    @property
+    def api(self):
+        return "/rest/api/3" if self.cloud else "/rest/api/2"
+
+    def base(self):
+        if self._base is None:
+            b = cfg("JIRA_BASE_URL").rstrip("/")
+            if not b:
+                raise Exit(4, "JIRA_BASE_URL not set in .sdw/config.env (run /sdw:onboard)")
+            u = urllib.parse.urlsplit(b)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                raise Exit(4, "JIRA_BASE_URL must be an http(s) URL")
+            if u.scheme == "http" and u.hostname not in LOCAL_HOSTS:
+                raise Exit(5, "refusing to send a token over plain http")
+            self._base = b
+        return self._base
+
+    def auth_header(self):
+        auth = cfg("JIRA_AUTH").lower() if cfg_has("JIRA_AUTH") else ""
+        auth = auth or ("basic" if self.cloud else "bearer")
+        if auth not in ("basic", "bearer"):
+            raise Exit(4, "JIRA_AUTH must be basic or bearer")
+        svc = "sdw:jira:" + self.base()
+        if not shutil.which("security"):
+            raise Exit(4, "security (macOS Keychain) not found")
+        r = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        tok = r.stdout.decode().rstrip("\n")
+        if r.returncode != 0 or not tok:
+            raise Exit(4, "no Keychain item %s; store it with: "
+                          "security add-generic-password -U -s '%s' -a '<account>' -w" % (svc, svc))
+        if any(c in tok for c in '"\\\r\n'):
+            raise Exit(4, "Keychain token has characters a curl config cannot carry")
+        if auth == "bearer":
+            return "Bearer " + tok, [tok]
+        email = cfg("JIRA_EMAIL")
+        if not email:
+            raise Exit(4, "JIRA_EMAIL not set (needed for basic auth)")
+        import base64
+        b64 = base64.b64encode(("%s:%s" % (email, tok)).encode()).decode()
+        return "Basic " + b64, [tok, b64]
+
+
+# ---------- HTTP ----------
+
+def full_path(conf, path):
+    if not path.startswith("/"):
+        path = "/" + path
+    return path if path.startswith("/rest/") else conf.api + path
+
+
+def query(path, params):
+    q = urllib.parse.urlencode([(k, v) for k, v in params if v not in (None, "")])
+    return path + ("?" + q if q else "")
+
+
+def request(conf, method, path, data=None, download=None):
+    """Returns (status, body bytes). The token reaches curl only through stdin.
+    download: write the body to that file instead, following redirects."""
+    if not shutil.which("curl"):
+        raise Exit(4, "curl not found")
+    url = conf.base() + path
+    header, secrets = conf.auth_header()
+    tmp = tempfile.mkdtemp(prefix="sdw-jira.")
+    try:
+        out = download or os.path.join(tmp, "body")
+        args = ["curl", "-q", "-sS", "-K", "-", "-X", method, "--connect-timeout", "10",
+                "--max-time", "60", "-o", out, "-w", "%{http_code}"]
+        if download:
+            args += ["-L", "--max-filesize", str(50 * 1024 * 1024)]
+        else:
+            args += ["-H", "Accept: application/json"]
+        if data is not None:
+            dfile = os.path.join(tmp, "data")
+            with open(dfile, "wb") as f:
+                f.write(data)
+            args += ["-H", "Content-Type: application/json", "--data-binary", "@" + dfile]
+        args.append(url)
+        conf_text = 'header = "Authorization: %s"\n' % header
+        r = subprocess.run(args, input=conf_text.encode(), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+        code = r.stdout.decode().strip() or "000"
+        if download and r.returncode != 0:
+            code = "000"
+        body = b""
+        if not download and os.path.exists(out):
+            with open(out, "rb") as f:
+                body = f.read()
+        if r.returncode != 0:
+            msg = r.stderr.decode(errors="replace")
+            for s in secrets:
+                msg = msg.replace(s, "***")
+            sys.stderr.write(msg)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    sys.stderr.write("HTTP %s\n" % code)
+    try:
+        return int(code), body
+    except ValueError:
+        return 0, body
+
+
+def ok(code):
+    return 200 <= code < 300
+
+
+def call(conf, method, path, obj=None):
+    """Processed calls: JSON back, or exit 1 with the error body on stderr."""
+    data = None if obj is None else json.dumps(obj).encode()
+    code, body = request(conf, method, path, data)
+    if not ok(code):
+        sys.stderr.write(body.decode(errors="replace")[:1000] + "\n")
+        raise Exit(1)
+    return json.loads(body.decode() or "null")
+
+
+def passthrough(conf, method, path, data=None):
+    code, body = request(conf, method, path, data)
+    sys.stdout.buffer.write(body)
+    if body and not body.endswith(b"\n"):
+        sys.stdout.buffer.write(b"\n")
+    return 0 if ok(code) else 1
+
+
+def dry_run(method, path, obj):
+    sys.stdout.write("%s %s\n" % (method, path))
+    if obj is not None:
+        sys.stdout.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+# ---------- light markdown -> ADF / wiki ----------
+
+HEAD = re.compile(r"^(#{1,6})\s+(.*)$")
+BUL = re.compile(r"^\s*[-*]\s+(.*)$")
+ORD = re.compile(r"^\s*\d+[.)]\s+(.*)$")
+FENCE = re.compile(r"^\s*```\s*([\w+-]*)\s*$")
+URL = re.compile(r"https?://[^\s<>()\[\]]*[^\s<>()\[\].,;:!?'\"]")
+
+
+def parse_blocks(text):
+    lines = text.replace("\r\n", "\n").split("\n")
+    out, para, lst = [], [], []
+    kind = [None]
+
+    def flush():
+        if para:
+            out.append(("p", list(para)))
+            del para[:]
+        if lst:
+            out.append((kind[0], list(lst)))
+            del lst[:]
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        fm = FENCE.match(line)
+        if fm:
+            flush()
+            code = []
+            i += 1
+            while i < len(lines) and not FENCE.match(lines[i]):
+                code.append(lines[i])
+                i += 1
+            out.append(("code", fm.group(1), "\n".join(code)))
+            i += 1
+            continue
+        if not line.strip():
+            flush()
+        elif HEAD.match(line):
+            flush()
+            m = HEAD.match(line)
+            out.append(("h", len(m.group(1)), m.group(2).strip()))
+        elif BUL.match(line) or ORD.match(line):
+            k = "ul" if BUL.match(line) else "ol"
+            if para or (lst and kind[0] != k):
+                flush()
+            kind[0] = k
+            lst.append((BUL.match(line) or ORD.match(line)).group(1).rstrip())
+        else:
+            if lst:
+                flush()
+            para.append(line.rstrip())
+        i += 1
+    flush()
+    return out
+
+
+def inline(text):
+    nodes, pos = [], 0
+    for m in URL.finditer(text):
+        if m.start() > pos:
+            nodes.append({"type": "text", "text": text[pos:m.start()]})
+        nodes.append({"type": "text", "text": m.group(0),
+                      "marks": [{"type": "link", "attrs": {"href": m.group(0)}}]})
+        pos = m.end()
+    if pos < len(text):
+        nodes.append({"type": "text", "text": text[pos:]})
+    return nodes
+
+
+def to_adf(text):
+    content = []
+    for b in parse_blocks(text):
+        if b[0] == "p":
+            c = []
+            for n, line in enumerate(b[1]):
+                if n:
+                    c.append({"type": "hardBreak"})
+                c.extend(inline(line))
+            content.append({"type": "paragraph", "content": c})
+        elif b[0] == "h":
+            content.append({"type": "heading", "attrs": {"level": b[1]}, "content": inline(b[2])})
+        elif b[0] in ("ul", "ol"):
+            items = [{"type": "listItem", "content": [{"type": "paragraph", "content": inline(t)}]}
+                     for t in b[1]]
+            content.append({"type": "bulletList" if b[0] == "ul" else "orderedList",
+                            "content": items})
+        else:
+            node = {"type": "codeBlock", "content": [{"type": "text", "text": b[2]}] if b[2] else []}
+            if b[1]:
+                node["attrs"] = {"language": b[1]}
+            content.append(node)
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def to_wiki(text):
+    parts = []
+    for b in parse_blocks(text):
+        if b[0] == "p":
+            parts.append("\n".join(b[1]))
+        elif b[0] == "h":
+            parts.append("h%d. %s" % (b[1], b[2]))
+        elif b[0] in ("ul", "ol"):
+            mark = "*" if b[0] == "ul" else "#"
+            parts.append("\n".join("%s %s" % (mark, t) for t in b[1]))
+        else:
+            parts.append("{code%s}\n%s\n{code}" % (":" + b[1] if b[1] else "", b[2]))
+    return "\n\n".join(parts)
+
+
+def render(conf, text):
+    return to_adf(text) if conf.cloud else to_wiki(text)
+
+
+def adf_text(node):
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(adf_text(n) for n in node)
+    t = node.get("type")
+    attrs = node.get("attrs") or {}
+    inner = "".join(adf_text(k) for k in node.get("content") or [])
+    if t == "text":
+        s = node.get("text", "")
+        for m in node.get("marks") or []:
+            href = (m.get("attrs") or {}).get("href", "") if m.get("type") == "link" else ""
+            if href and href != s:
+                s += " (%s)" % href
+        return s
+    if t == "hardBreak":
+        return "\n"
+    if t in ("inlineCard", "blockCard", "embedCard"):
+        return attrs.get("url", "") + ("" if t == "inlineCard" else "\n")
+    if t in ("mention", "emoji"):
+        return attrs.get("text") or attrs.get("shortName") or ""
+    if t in ("media", "mediaInline"):
+        return "[attachment: %s]" % attrs["alt"] if attrs.get("alt") else "[attachment]"
+    if t == "codeBlock":
+        return "```\n%s\n```\n" % inner
+    if t == "heading":
+        return "%s %s\n" % ("#" * int(attrs.get("level", 2)), inner)
+    if t == "listItem":
+        return "- " + inner.strip("\n").replace("\n", "\n  ") + "\n"
+    if t in ("tableCell", "tableHeader"):
+        return inner.strip() + " | "
+    if t in ("paragraph", "blockquote", "panel", "tableRow", "rule"):
+        return inner + "\n"
+    return inner
+
+
+# ---------- helpers ----------
+
+def take(args, flag, many=False):
+    vals = []
+    while flag in args:
+        i = args.index(flag)
+        if i + 1 >= len(args):
+            usage("%s needs a value" % flag)
+        vals.append(args[i + 1])
+        del args[i:i + 2]
+    if many:
+        return vals
+    if len(vals) > 1:
+        usage("%s given twice" % flag)
+    return vals[0] if vals else None
+
+
+def flag(args, name):
+    if name in args:
+        args.remove(name)
+        return True
+    return False
+
+
+def no_more(args):
+    if args:
+        usage("unexpected argument %r" % args[0])
+
+
+def key_arg(args):
+    if not args:
+        usage("missing issue key")
+    k = args.pop(0)
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_]*-\d+$|^\d+$", k):
+        usage("not an issue key: %r" % k)
+    return k
+
+
+def read_text(path):
+    if path == "-":
+        return sys.stdin.read()
+    if not os.path.isfile(path):
+        raise Exit(4, "file not found: %s" % path)
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def local_midnight_ms(day):
+    try:
+        d = datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        usage("expected YYYY-MM-DD, got %r" % day)
+    return int(d.astimezone().timestamp() * 1000)
+
+
+def parse_started(s):
+    if s == "now":
+        dt = datetime.now().astimezone().replace(microsecond=0)
+    else:
+        m = re.match(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:\.\d+)?)?\s*"
+                     r"(Z|[+-]\d\d:?\d\d)?$", s.strip())
+        if not m:
+            usage("--started wants YYYY-MM-DDTHH:MM[:SS][+hhmm], got %r" % s)
+        dt = datetime(*[int(x) for x in m.groups()[:5]], second=int(m.group(6) or 0))
+        tz = m.group(7)
+        if tz is None:
+            dt = dt.astimezone()
+        elif tz == "Z":
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            sign = -1 if tz[0] == "-" else 1
+            hh, mm = int(tz[1:3]), int(tz[-2:])
+            dt = dt.replace(tzinfo=timezone(sign * timedelta(hours=hh, minutes=mm)))
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000%z")
+
+
+def parse_duration(s):
+    m = re.match(r"^(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+)m)?$", s.strip())
+    if not s.strip() or not m or not (m.group(1) or m.group(2)):
+        usage("--duration wants e.g. 45m, 1h30m, 1.5h; got %r" % s)
+    secs = int(round(float(m.group(1) or 0) * 3600)) + int(m.group(2) or 0) * 60
+    if secs < 60 or secs > 24 * 3600:
+        usage("--duration must be between 1m and 24h")
+    return secs
+
+
+def me_id(conf):
+    me = call(conf, "GET", conf.api + "/myself")
+    return me.get("accountId") if conf.cloud else (me.get("name") or me.get("key"))
+
+
+def author_id(conf, a):
+    a = a or {}
+    return a.get("accountId") if conf.cloud else (a.get("name") or a.get("key"))
+
+
+def hms(secs):
+    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+
+
+# ---------- subcommands ----------
+
+def cmd_raw(method, args):
+    if not args:
+        usage("missing path")
+    path = args.pop(0)
+    data = None
+    if args:
+        p = args.pop(0)
+        if not p.startswith("@"):
+            usage("payload must be @file.json or @-")
+        raw = read_text(p[1:]) if p != "@-" else sys.stdin.read()
+        try:
+            json.loads(raw)
+        except ValueError:
+            raise Exit(2, "payload is not valid JSON")
+        data = raw.encode()
+    no_more(args)
+    if data is not None and method == "GET":
+        usage("GET takes no payload")
+    conf = Conf()
+    return passthrough(conf, method, full_path(conf, path), data)
+
+
+def cmd_myself(args):
+    no_more(args)
+    conf = Conf()
+    return passthrough(conf, "GET", conf.api + "/myself")
+
+
+def default_issue_fields():
+    f = ["summary", "status", "issuetype", "assignee", "reporter", "priority", "labels", "parent",
+         "subtasks", "issuelinks", "description", "attachment", "comment"]
+    for k in ("JIRA_AC_FIELD", "JIRA_SPRINT_FIELD"):
+        v = cfg(k)
+        if v:
+            f.append(v)
+    return ",".join(f)
+
+
+def sprint_names(v):
+    names = []
+    for s in v or []:
+        if isinstance(s, dict):
+            names.append(s.get("name", ""))
+        else:
+            m = re.search(r"name=([^,\]]+)", str(s))
+            names.append(m.group(1) if m else str(s))
+    return ", ".join(n for n in names if n)
+
+
+def cmd_issue(args):
+    k = key_arg(args)
+    fields = take(args, "--fields")
+    text = flag(args, "--text")
+    no_more(args)
+    conf = Conf()
+    path = query(conf.api + "/issue/" + urllib.parse.quote(k),
+                 [("fields", fields or default_issue_fields())])
+    if not text:
+        return passthrough(conf, "GET", path)
+    it = call(conf, "GET", path)
+    f = it.get("fields") or {}
+    name = lambda o: (o or {}).get("displayName") or (o or {}).get("name") or ""
+    out = ["%s [%s] %s — %s" % (it.get("key", k), name(f.get("issuetype")),
+                                name(f.get("status")), f.get("summary", ""))]
+    out.append("Assignee: %s" % (name(f.get("assignee")) or "unassigned"))
+    if f.get("reporter"):
+        out.append("Reporter: %s" % name(f.get("reporter")))
+    if f.get("labels"):
+        out.append("Labels: " + ", ".join(f["labels"]))
+    if f.get("parent"):
+        p = f["parent"]
+        out.append("Parent: %s %s" % (p.get("key"), (p.get("fields") or {}).get("summary", "")))
+    sf = cfg("JIRA_SPRINT_FIELD")
+    if sf and f.get(sf):
+        out.append("Sprint: " + sprint_names(f.get(sf)))
+    for s in f.get("subtasks") or []:
+        sfl = s.get("fields") or {}
+        out.append("Subtask: %s [%s] %s" % (s.get("key"), name(sfl.get("status")),
+                                            sfl.get("summary", "")))
+    for l in f.get("issuelinks") or []:
+        o = l.get("outwardIssue") or l.get("inwardIssue") or {}
+        rel = (l.get("type") or {}).get("outward" if "outwardIssue" in l else "inward", "")
+        out.append("Link: %s %s %s" % (rel, o.get("key", ""),
+                                       (o.get("fields") or {}).get("summary", "")))
+    out += ["", "## Description", adf_text(f.get("description")).strip() or "(none)"]
+    ac = cfg("JIRA_AC_FIELD")
+    if ac:
+        out += ["", "## Acceptance criteria (%s)" % ac, adf_text(f.get(ac)).strip() or "(none)"]
+    atts = sorted((a for a in f.get("attachment") or [] if isinstance(a, dict)),
+                  key=lambda a: a.get("created") or "", reverse=True)
+    if atts:
+        out += ["", "## Attachments (%d)" % len(atts)]
+        out += ["- %s (%s, %s, id %s, %s)" % (a.get("filename", "?"), a.get("mimeType", "?"),
+                                              human_size(a.get("size")), a.get("id", "?"),
+                                              (a.get("created") or "")[:16]) for a in atts]
+    comments = (f.get("comment") or {}).get("comments") or []
+    if comments:
+        out += ["", "## Comments (%d)" % len(comments)]
+        for c in comments:
+            out += ["### %s %s" % (name(c.get("author")), (c.get("created") or "")[:16]),
+                    adf_text(c.get("body")).strip()]
+    sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
+def human_size(n):
+    if not isinstance(n, int):
+        return "? B"
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024.0
+
+
+CONFIG_SEGS = {".git", ".claude", ".github", ".gitlab", ".vscode", ".idea", ".husky"}
+
+
+def out_file(path):
+    """FILE resolved through its nearest existing ancestor; only under the sdw work dir or the temp dir."""
+    if path.endswith(os.sep) or os.path.isdir(path):
+        usage("--out names a file, not a directory")
+    p = os.path.abspath(path)
+    if os.path.lexists(p):
+        raise Exit(5, "refusing to overwrite %s" % path)
+    head, tail = p, []
+    while not os.path.exists(head):
+        head, t = os.path.split(head)
+        tail.insert(0, t)
+    real = os.path.join(os.path.realpath(head), *tail)
+
+    def under(x):
+        return bool(x) and real.startswith(os.path.realpath(x).rstrip(os.sep) + os.sep)
+
+    def out(cmd):
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return r.stdout.decode().strip() if r.returncode == 0 else ""
+
+    proj = out([os.path.join(HERE, "sdw-workdir"), "--projdir"])
+    work = os.path.join(proj, ".sdw", "work") if proj else ""
+    top = out(["git", "rev-parse", "--show-toplevel"])
+    segs = real.split(os.sep)
+    ok = under(work) or (any(under(x) for x in (tempfile.gettempdir(), "/tmp"))
+                         and not under(proj) and not under(top))
+    if not ok or CONFIG_SEGS.intersection(segs) or segs[-1] in (".envrc", ".mcp.json"):
+        raise Exit(5, "--out must be under <projdir>/.sdw/work/ or the temp dir, outside config dirs: %s" % path)
+    return real
+
+
+def cmd_attachment(args):
+    if not args or not re.match(r"^\d+$", args[0]):
+        usage("attachment needs a numeric id")
+    aid = args.pop(0)
+    out = take(args, "--out")
+    no_more(args)
+    if not out:
+        usage("attachment needs --out FILE")
+    dest = out_file(out)
+    conf = Conf()
+    meta = call(conf, "GET", conf.api + "/attachment/" + aid) or {}
+    content = meta.get("content") or (conf.base() + conf.api + "/attachment/content/" + aid)
+    if not content.startswith(conf.base() + "/"):
+        raise Exit(5, "attachment content is outside JIRA_BASE_URL; not sending the token there")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    fd, part = tempfile.mkstemp(prefix=".sdw-jira.", dir=os.path.dirname(dest))
+    os.close(fd)
+    try:
+        code, _ = request(conf, "GET", content[len(conf.base()):], download=part)
+        if not ok(code):
+            raise Exit(1)
+        os.rename(part, dest)
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
+    sys.stdout.write("%s\t%s\t%s\n" % (dest, meta.get("mimeType", "?"), human_size(meta.get("size"))))
+    return 0
+
+
+def cmd_transitions(args):
+    k = key_arg(args)
+    no_more(args)
+    conf = Conf()
+    return passthrough(conf, "GET", conf.api + "/issue/%s/transitions" % urllib.parse.quote(k))
+
+
+def cmd_transition(args):
+    k = key_arg(args)
+    dry = flag(args, "--dry-run")
+    if not args or not re.match(r"^\d+$", args[0]):
+        usage("transition wants a numeric transition id (see: sdw-jira transitions KEY)")
+    tid = args.pop(0)
+    no_more(args)
+    conf = Conf()
+    path = conf.api + "/issue/%s/transitions" % urllib.parse.quote(k)
+    body = {"transition": {"id": tid}}
+    if dry:
+        return dry_run("POST", path, body)
+    return passthrough(conf, "POST", path, json.dumps(body).encode())
+
+
+def search_path(conf, jql, fields, mx):
+    p = conf.api + ("/search/jql" if conf.cloud else "/search")
+    return query(p, [("jql", jql), ("fields", fields), ("maxResults", str(mx))])
+
+
+def cmd_search(args):
+    fields = take(args, "--fields") or "summary,status,issuetype,assignee,updated"
+    mx = take(args, "--max") or "50"
+    brief = flag(args, "--brief")
+    if not re.match(r"^\d+$", mx):
+        usage("--max wants a number")
+    if len(args) != 1:
+        usage("search wants exactly one JQL argument (quote it)")
+    conf = Conf()
+    path = search_path(conf, args[0], fields, mx)
+    if not brief:
+        return passthrough(conf, "GET", path)
+    for it in call(conf, "GET", path).get("issues") or []:
+        f = it.get("fields") or {}
+        sys.stdout.write("%s\t%s\t%s\n" % (it.get("key"), (f.get("status") or {}).get("name", ""),
+                                           f.get("summary", "")))
+    return 0
+
+
+def cmd_sprint(args):
+    conf = Conf()
+    project = take(args, "--project") or cfg("JIRA_PROJECT")
+    no_more(args)
+    if not project:
+        raise Exit(4, "no project: pass --project or set JIRA_PROJECT")
+    boards = call(conf, "GET", query("/rest/agile/1.0/board",
+                                     [("projectKeyOrId", project), ("type", "scrum")]))
+    seen = set()
+    for b in (boards or {}).get("values") or []:
+        sp = call(conf, "GET", "/rest/agile/1.0/board/%s/sprint?state=active" % b.get("id"))
+        for s in (sp or {}).get("values") or []:
+            if s.get("id") in seen:
+                continue
+            seen.add(s.get("id"))
+            sys.stdout.write("%s\t%s\tboard %s %s\n" % (s.get("id"), s.get("name", ""),
+                                                        b.get("id"), b.get("name", "")))
+    return 0
+
+
+def worklogs(conf, k, since_ms):
+    path = conf.api + "/issue/%s/worklog" % urllib.parse.quote(k)
+    return call(conf, "GET", query(path, [("startedAfter", since_ms)])).get("worklogs") or []
+
+
+def cmd_worklog(args):
+    if not args:
+        usage("worklog wants list, mine or add")
+    sub = args.pop(0)
+    if sub == "list":
+        k = key_arg(args)
+        since = take(args, "--since")
+        mine = flag(args, "--mine")
+        no_more(args)
+        if since and not re.match(r"^\d{10,}$", since):
+            since = str(local_midnight_ms(since))
+        conf = Conf()
+        if not mine:
+            path = conf.api + "/issue/%s/worklog" % urllib.parse.quote(k)
+            return passthrough(conf, "GET", query(path, [("startedAfter", since)]))
+        me = me_id(conf)
+        for w in worklogs(conf, k, since):
+            if author_id(conf, w.get("author")) == me:
+                sys.stdout.write("%s\t%s\t%s\n" % (w.get("id"), w.get("started"),
+                                                   w.get("timeSpentSeconds")))
+        return 0
+    if sub == "mine":
+        if len(args) != 1:
+            usage("worklog mine wants one YYYY-MM-DD")
+        day = args[0]
+        since = local_midnight_ms(day) - 86400000
+        conf = Conf()
+        me = me_id(conf)
+        jql = 'worklogAuthor = currentUser() AND worklogDate = "%s"' % day
+        total = 0
+        for it in call(conf, "GET", search_path(conf, jql, "summary", 100)).get("issues") or []:
+            for w in worklogs(conf, it["key"], since):
+                if author_id(conf, w.get("author")) == me and (w.get("started") or "")[:10] == day:
+                    secs = int(w.get("timeSpentSeconds") or 0)
+                    total += secs
+                    sys.stdout.write("%s\t%s\t%s\t%d\n" % (it["key"], w.get("id"),
+                                                           w.get("started"), secs))
+        sys.stdout.write("TOTAL\t%d\t%s\n" % (total, hms(total)))
+        return 0
+    if sub == "add":
+        k = key_arg(args)
+        started = take(args, "--started")
+        duration = take(args, "--duration")
+        comment = take(args, "--comment")
+        cfile = take(args, "--comment-file")
+        dry = flag(args, "--dry-run")
+        no_more(args)
+        if not started or not duration:
+            usage("worklog add needs --started and --duration")
+        if comment is not None and cfile:
+            usage("--comment and --comment-file are exclusive")
+        body = {"started": parse_started(started), "timeSpentSeconds": parse_duration(duration)}
+        text = read_text(cfile) if cfile else comment
+        conf = Conf()
+        if text and text.strip():
+            body["comment"] = render(conf, text.strip())
+        path = conf.api + "/issue/%s/worklog" % urllib.parse.quote(k)
+        if dry:
+            return dry_run("POST", path, body)
+        return passthrough(conf, "POST", path, json.dumps(body).encode())
+    usage("unknown worklog subcommand %r" % sub)
+
+
+def cmd_create(args):
+    itype = take(args, "--type")
+    summary = take(args, "--summary")
+    project = take(args, "--project")
+    dfile = take(args, "--description-file")
+    assignee = take(args, "--assignee")
+    sprint = take(args, "--sprint")
+    labels = take(args, "--label", many=True)
+    dry = flag(args, "--dry-run")
+    no_more(args)
+    if not itype or not summary:
+        usage("create needs --type and --summary")
+    summary = summary.strip()
+    if not summary or "\n" in summary or len(summary) > 255:
+        usage("--summary must be one line, 1-255 chars")
+    if sprint and not re.match(r"^\d+$", sprint):
+        usage("--sprint wants a numeric sprint id (see: sdw-jira sprint)")
+    for l in labels:
+        if not l or re.search(r"\s", l):
+            usage("labels cannot contain spaces: %r" % l)
+    conf = Conf()
+    project = project or cfg("JIRA_PROJECT")
+    if not project:
+        raise Exit(4, "no project: pass --project or set JIRA_PROJECT")
+    fields = {"project": {"key": project}, "issuetype": {"name": itype}, "summary": summary}
+    if dfile:
+        text = read_text(dfile).strip()
+        if text:
+            fields["description"] = render(conf, text)
+    if assignee:
+        aid = me_id(conf) if assignee == "me" else assignee
+        fields["assignee"] = {"accountId": aid} if conf.cloud else {"name": aid}
+    if sprint:
+        sf = cfg("JIRA_SPRINT_FIELD")
+        if not sf:
+            raise Exit(4, "JIRA_SPRINT_FIELD not set; omit --sprint or run /sdw:onboard")
+        fields[sf] = int(sprint)
+    if labels:
+        fields["labels"] = labels
+    body = {"fields": fields}
+    path = conf.api + "/issue"
+    if dry:
+        return dry_run("POST", path, body)
+    return passthrough(conf, "POST", path, json.dumps(body).encode())
+
+
+def cmd_render(args):
+    fl = take(args, "--flavor")
+    no_more(args)
+    if fl and fl not in ("cloud", "dc"):
+        usage("--flavor is cloud or dc")
+    conf = Conf(fl)
+    out = render(conf, sys.stdin.read().strip())
+    sys.stdout.write((json.dumps(out, indent=2, ensure_ascii=False) if conf.cloud else out) + "\n")
+    return 0
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(USAGE)
+        return 2
+    if argv[0] in ("-h", "--help", "help") or "-h" in argv[1:] or "--help" in argv[1:]:
+        sys.stdout.write(USAGE)
+        return 0
+    cmd, args = argv[0], list(argv[1:])
+    if cmd in ("GET", "POST", "PUT"):
+        return cmd_raw(cmd, args)
+    table = {"myself": cmd_myself, "issue": cmd_issue, "transitions": cmd_transitions,
+             "transition": cmd_transition, "search": cmd_search, "sprint": cmd_sprint,
+             "worklog": cmd_worklog, "create": cmd_create, "render": cmd_render,
+             "attachment": cmd_attachment}
+    if cmd not in table:
+        usage("unknown command %r" % cmd)
+    return table[cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exit as e:
+        if e.msg:
+            err(e.msg)
+        sys.exit(e.code)
+    except ValueError:
+        err("response was not JSON")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(1)

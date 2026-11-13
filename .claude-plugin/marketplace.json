@@ -1,0 +1,14 @@
+{
+  "name": "sdw-local",
+  "description": "Release channel for the sdw Claude Code plugin, part of Portolan",
+  "owner": {
+    "name": "Le Nhat Quang"
+  },
+  "plugins": [
+    {
+      "name": "sdw",
+      "source": "./plugin",
+      "description": "Evidence-first dev workflow with independent QA and review"
+    }
+  ]
+}

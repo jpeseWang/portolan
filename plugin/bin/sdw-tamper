@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""usage: sdw-tamper [--staged | --range A..B]
+       sdw-tamper --test-paths < paths
+
+Scan a change for weakened tests. Default: `git diff HEAD` plus untracked files.
+Prints `<kind> <path>:<line> <snippet>` per hit; kinds: test-deleted, skip-added,
+assert-removed, snapshot-changed, threshold-loosened, suppression-added.
+Line 0 means the whole file. --test-paths prints the stdin paths that are test paths.
+Exit 0 no hits, 1 hits, 2 usage, 4 not a git repo or git failed."""
+import collections
+import os
+import re
+import subprocess
+import sys
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+TEST_BASENAME = re.compile(
+    r"(\.(test|spec)\.[^/]+|_test\.[^/]+|^test_[^/]*\.py|Tests?\.cs|\.snap)$")
+TEST_SEGMENTS = {"test", "tests", "__tests__", "__snapshots__", "__screenshots__", "e2e", "spec"}
+DOC = re.compile(r"(\.(md|mdx|txt)$|^(docs|local-docs)/)")
+GENERATED = re.compile(
+    r"(\.Designer\.cs|\.g\.cs|\.g\.i\.cs|ModelSnapshot\.cs|\.generated\.\w+|\.min\.js)$|(^|/)Migrations/")
+IMAGE = re.compile(r"\.(png|jpe?g|webp|gif)$", re.I)
+TEST_CONFIG = re.compile(
+    r"(^|/)((playwright|jest|vitest|vite|karma|cypress|wdio)\.config\.[\w.]+|\.mocharc[\w.]*|"
+    r"\.nycrc[\w.]*|\.c8rc[\w.]*|pytest\.ini|setup\.cfg|tox\.ini|pyproject\.toml|"
+    r"codecov\.ya?ml|package\.json|[^/]*\.runsettings)$")
+
+DECL = re.compile(
+    r"^\s*(?:(?:it|test|specify)(?:\.\w+)*\s*\(|(?:async\s+)?def\s+test\w*\s*\(|func\s+Test\w*\s*\(|"
+    r"\[\s*(?:Fact|Theory|Test|TestMethod|TestCase)\b|@Test\b|#\[test\])")
+SKIP = re.compile(
+    r"\b(?:it|test|describe|context|suite|specify)(?:\.(?:describe|concurrent|serial|parallel))?"
+    r"\.(?:skip|only|fixme|todo)\b|\b(?:xit|xtest|xdescribe|xcontext|xspecify|fit|fdescribe)\s*\(|"
+    r"\[\s*(?:Fact|Theory|Test|TestMethod|TestCase)\s*\([^)]*\bSkip\s*=|[\[,]\s*(?:Ignore|Explicit)\b|"
+    r"@pytest\.mark\.(?:skip|skipif|xfail)\b|@unittest\.(?:skip\w*|expectedFailure)\b|"
+    r"\bpytest\.(?:skip|xfail)\s*\(|\bself\.skipTest\s*\(|\bt\.Skip(?:Now|f)?\s*\(|"
+    r"@(?:Disabled|Ignore)\b|#\[ignore\]|\bSkip\.(?:If|IfNot|Unless)\s*\(")
+ASSERT = re.compile(
+    r"\bexpect\s*\(|^\s*\.(?:not\.)?(?:to(?!String\b)[A-Z]\w*|resolves|rejects)\b|\bassert(?:\w*\s*\(|\s|\.\w+\s*\()|"
+    r"\bAssert\.\w+|\bself\.assert\w+\s*\(|\.Should\(\)|\.should\b|\bassertThat\s*\(|"
+    r"\bt\.(?:Error|Errorf|Fatal|Fatalf|Fail)\b|\brequire\.\w+\s*\(|\bVerify\w*\s*\(")
+WEAK = re.compile(
+    r"\.(?:toBeDefined|toBeTruthy|toBeFalsy|toBeUndefined|toBeNull|toBeNaN|toBeInstanceOf|"
+    r"toMatchObject|toBeGreaterThan|toBeGreaterThanOrEqual|toBeLessThan|toBeLessThanOrEqual|"
+    r"toHaveBeenCalled|toBeAttached)\s*\(|\bexpect\.(?:anything|any)\s*\(|\bassert\.ok\s*\(|"
+    r"\bassert(?:True|False|IsNotNone|IsNone|IsInstance|Greater|Less)\w*\s*\(|"
+    r"\bAssert\.(?:NotNull|True|False|IsTrue|IsFalse|IsNotNull|NotEmpty|Pass)\b|"
+    r"\.Should\(\)\.(?:NotBeNull|BeTrue|BeFalse|NotBeEmpty)\b|^\s*assert\s+[^=<>!]*$")
+SUPPRESS = re.compile(
+    r"eslint-disable|@ts-(?:ignore|expect-error|nocheck)|#\s*type:\s*ignore|#\s*noqa\b|"
+    r"pylint:\s*disable|#pragma\s+warning\s+disable|\[SuppressMessage\(|@SuppressWarnings\b|"
+    r"\bNOSONAR\b|rubocop:disable|biome-ignore|deno-lint-ignore|//\s*nolint\b|"
+    r"(?:istanbul|c8|v8)\s+ignore|#\[allow\(|<NoWarn>|<TreatWarningsAsErrors>\s*false")
+LOOSER_IF_SMALLER = re.compile(
+    r"coverage|branches|\blines\b|functions|statements|fail.under|toBeCloseTo|minimum", re.I)
+LOOSER_IF_LARGER = re.compile(
+    r"timeout|maxDiffPixel|threshold|retries|\bretry\b|tolerance|epsilon|\bdelta\b", re.I)
+NUM = re.compile(r"(?<![\w.])\d[\d_]*(?:\.\d+)?(?:e\d+)?(?![\w.])", re.I)
+
+
+def die(code, msg):
+    sys.stderr.write("sdw-tamper: %s\n" % msg)
+    sys.exit(code)
+
+
+def is_test(path):
+    if path.startswith(".sdw/") or "/.sdw/" in path:
+        return False
+    parts = path.split("/")
+    if TEST_BASENAME.search(parts[-1]):
+        return True
+    return any(p in TEST_SEGMENTS or p.endswith((".Tests", ".Test", "-snapshots")) for p in parts[:-1])
+
+
+def is_snapshot(path):
+    parts = path.split("/")
+    if parts[-1].endswith(".snap") or ".verified." in parts[-1]:
+        return True
+    if any(p in ("__snapshots__", "__screenshots__") or p.endswith("-snapshots") for p in parts[:-1]):
+        return True
+    return bool(IMAGE.search(path)) and is_test(path)
+
+
+def git(args, check=True):
+    p = subprocess.run(["git", "-c", "core.quotePath=false"] + args,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and p.returncode != 0:
+        return None
+    return p.stdout
+
+
+def unquote(s):
+    if not s.startswith('"'):
+        return s
+    raw = s[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+    return raw.encode("latin-1").decode("utf-8", "replace")
+
+
+class F:
+    def __init__(self):
+        self.path = None
+        self.status = "M"
+        self.binary = False
+        self.removed = []
+        self.added = []
+
+
+def strip_prefix(s):
+    s = unquote(s.rstrip("\t"))
+    return s[2:] if s[:2] in ("a/", "b/") else s
+
+
+def parse(diff):
+    files, f, in_hunk, old_ln, new_ln = [], None, False, 0, 0
+    for raw in diff.split(b"\n"):
+        line = raw.decode("utf-8", "replace")
+        if line.startswith("diff --git "):
+            f = F()
+            files.append(f)
+            in_hunk = False
+            rest = line[11:]
+            if not rest.startswith('"'):
+                half = (len(rest) - 5) // 2
+                f.path = rest[2:2 + half] if rest[2 + half:5 + half] == " b/" else rest[2:]
+            continue
+        if f is None:
+            continue
+        if not in_hunk:
+            if line.startswith("deleted file mode"):
+                f.status = "D"
+            elif line.startswith("new file mode"):
+                f.status = "A"
+            elif line.startswith("rename to "):
+                f.status, f.path = "R", unquote(line[10:])
+            elif line.startswith("Binary files"):
+                f.binary = True
+            elif line.startswith("--- ") and line[4:] != "/dev/null":
+                f.path = strip_prefix(line[4:])
+            elif line.startswith("+++ ") and line[4:] != "/dev/null":
+                f.path = strip_prefix(line[4:])
+        if line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(,0)?", line)
+            if m:
+                in_hunk, old_ln, new_ln = True, int(m.group(1)), int(m.group(2)) + bool(m.group(3))
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("-"):
+            f.removed.append((max(new_ln, 1) if f.status != "D" else 0, line[1:]))
+            old_ln += 1
+        elif line.startswith("+"):
+            f.added.append((new_ln, line[1:]))
+            new_ln += 1
+    return [x for x in files if x.path]
+
+
+def untracked():
+    out = git(["ls-files", "--others", "--exclude-standard", "-z"]) or b""
+    files = []
+    for p in out.decode("utf-8", "replace").split("\0"):
+        if not p or p.startswith(".sdw/") or os.path.isdir(p):
+            continue
+        try:
+            if os.path.getsize(p) > 512 * 1024:
+                continue
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        f = F()
+        f.path, f.status = p, "A"
+        if b"\0" in data:
+            f.binary = True
+        else:
+            f.added = list(enumerate(data.decode("utf-8", "replace").split("\n"), 1))
+        files.append(f)
+    return files
+
+
+def norm(s):
+    return " ".join(s.split()).rstrip(";,")
+
+
+def snip(s):
+    s = " ".join(s.split())
+    return s[:117] + "..." if len(s) > 120 else s
+
+
+def weight(s):
+    if not ASSERT.search(s):
+        return 0
+    return 1 if WEAK.search(s) else 2
+
+
+def numbers(s):
+    out = []
+    for n in NUM.findall(s):
+        try:
+            out.append(float(n.replace("_", "")))
+        except ValueError:
+            pass
+    return out
+
+
+def loosened(old, new):
+    a, b = numbers(old), numbers(new)
+    if not a or not b:
+        return False
+    smaller = bool(LOOSER_IF_SMALLER.search(new))
+    if not smaller and not LOOSER_IF_LARGER.search(new):
+        return False
+    pairs = list(zip(a, b)) if len(a) == len(b) else [(max(a), max(b))]
+    return any((y < x) if smaller else (y > x) for x, y in pairs)
+
+
+def scan(files):
+    hits = []
+    moved_out = collections.Counter(norm(t) for f in files for _, t in f.removed)
+    moved_in = collections.Counter(norm(t) for f in files for _, t in f.added)
+
+    def new_only(f):
+        return [(n, t) for n, t in f.added if moved_out[norm(t)] == 0]
+
+    def gone_only(f):
+        return [(n, t) for n, t in f.removed if moved_in[norm(t)] == 0]
+
+    for f in files:
+        test = is_test(f.path) and not DOC.search(f.path)
+        snap = is_snapshot(f.path)
+        if snap:
+            if f.status in ("M", "D", "R") and (f.binary or f.added or f.removed):
+                first = (f.added or f.removed or [(0, "(binary changed)")])[0]
+                what = "(deleted)" if f.status == "D" else first[1]
+                hits.append(("snapshot-changed", f.path, first[0], what))
+            continue
+        if test and f.status == "D":
+            if TEST_BASENAME.search(f.path.split("/")[-1]) or any(DECL.search(t) for _, t in f.removed):
+                hits.append(("test-deleted", f.path, 0, "(file deleted)"))
+            continue
+        if f.binary:
+            continue
+        if test:
+            gone = gone_only(f)
+            new = new_only(f)
+            d_gone = [x for x in gone if DECL.search(x[1])]
+            if len(d_gone) > len([x for x in new if DECL.search(x[1])]):
+                hits += [("test-deleted", f.path, n, t) for n, t in d_gone]
+            hits += [("skip-added", f.path, n, t) for n, t in new if SKIP.search(t)]
+            if sum(weight(t) for _, t in gone) > sum(weight(t) for _, t in new):
+                hits += [("assert-removed", f.path, n, t) for n, t in gone if weight(t)]
+        if test or TEST_CONFIG.search(f.path):
+            pool = collections.defaultdict(list)
+            for n, t in f.removed:
+                pool[NUM.sub("#", norm(t))].append(t)
+            for n, t in f.added:
+                olds = pool.get(NUM.sub("#", norm(t)))
+                if olds:
+                    old = olds.pop(0)
+                    if loosened(old, t):
+                        hits.append(("threshold-loosened", f.path, n, "%s -> %s" % (norm(old), norm(t))))
+        if not DOC.search(f.path) and not GENERATED.search(f.path):
+            hits += [("suppression-added", f.path, n, t) for n, t in new_only(f) if SUPPRESS.search(t)]
+    return hits
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv == ["--test-paths"]:
+        for p in sys.stdin.read().splitlines():
+            p = p.strip()
+            if p and is_test(p):
+                print(p)
+        return 0
+    if argv not in ([], ["--staged"]) and not (len(argv) == 2 and argv[0] == "--range" and ".." in argv[1]):
+        sys.stderr.write(__doc__ + "\n")
+        return 2
+    top = git(["rev-parse", "--show-toplevel"])
+    if not top:
+        die(4, "not inside a git work tree")
+    os.chdir(top.decode().strip())
+    base = "HEAD" if git(["rev-parse", "--verify", "-q", "HEAD"]) else EMPTY_TREE
+    common = ["diff", "-M", "-U0", "--no-color", "--no-ext-diff"]
+    if not argv:
+        diff, extra = git(common + [base]), untracked()
+    elif argv == ["--staged"]:
+        diff, extra = git(common + ["--cached", base]), []
+    else:
+        diff, extra = git(common + [argv[1]]), []
+        if diff is None:
+            die(2, "bad range: %s" % argv[1])
+    if diff is None:
+        die(4, "git diff failed")
+    files = [f for f in parse(diff) + extra if not (f.path.startswith(".sdw/") or "/.sdw/" in f.path)]
+    hits = scan(files)
+    for kind, path, n, text in hits:
+        print("%s %s:%d %s" % (kind, path, n, snip(text)))
+    return 1 if hits else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

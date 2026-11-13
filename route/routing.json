@@ -1,0 +1,45 @@
+{
+  "_doc": "Priority chains per role. First entry whose quota is above 'min' wins. pool: claude | codex | antigravity:Gemini | antigravity:Claude and GPT | deepseek. min keys: 5h, 7d (claude) or * (one window, percent left; deepseek is USD balance). A key the account does not have is not checked. deny_env: name of an environment variable holding a colon-separated list of directories where the entry is skipped (env.zsh exports AIM_NO_DS_PATHS_STR from local.zsh). ai-quota --roles lists the roles.",
+  "chains": {
+    "lead": [
+      {"name": "claude-opus",   "vendor": "anthropic", "cmd": "claude --model opus",   "pool": "claude", "min": {"5h": 30, "7d": 15}},
+      {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude", "min": {"5h": 10, "7d": 5}},
+      {"name": "agy-sonnet",    "vendor": "anthropic", "cmd": "agy --model claude-sonnet-4-6", "pool": "antigravity:Claude and GPT", "min": {"*": 10}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}},
+      {"name": "agy-gemini",    "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-high", "pool": "antigravity:Gemini", "min": {"*": 10}}
+    ],
+    "worker": [
+      {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude", "min": {"5h": 10, "7d": 5}},
+      {"name": "agy-gemini",    "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-high", "pool": "antigravity:Gemini", "min": {"*": 10}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}},
+      {"name": "claude-ds",     "vendor": "deepseek",  "cmd": "claude-ds", "pool": "deepseek", "min": {"*": 0.2}, "deny_env": "AIM_NO_DS_PATHS_STR"}
+    ],
+    "reviewer": [
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}},
+      {"name": "agy-gemini",    "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-high --mode plan", "pool": "antigravity:Gemini", "min": {"*": 10}},
+      {"name": "agy-sonnet",    "vendor": "anthropic", "cmd": "agy --model claude-sonnet-4-6 --mode plan", "pool": "antigravity:Claude and GPT", "min": {"*": 10}},
+      {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude", "min": {"5h": 10, "7d": 5}}
+    ],
+    "qa-design": [
+      {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude", "min": {"5h": 10, "7d": 5}},
+      {"name": "agy-gemini",    "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-high", "pool": "antigravity:Gemini", "min": {"*": 10}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}}
+    ],
+    "qa-run": [
+      {"name": "agy-flash",     "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-medium", "pool": "antigravity:Gemini", "min": {"*": 10}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}},
+      {"name": "claude-haiku",  "vendor": "anthropic", "cmd": "claude --model haiku",  "pool": "claude", "min": {"5h": 5, "7d": 3}},
+      {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude", "min": {"5h": 10, "7d": 5}}
+    ],
+    "qa-report": [
+      {"name": "agy-flash-low", "vendor": "google",    "cmd": "agy --model gemini-3.8-flash-low", "pool": "antigravity:Gemini", "min": {"*": 10}},
+      {"name": "claude-haiku",  "vendor": "anthropic", "cmd": "claude --model haiku",  "pool": "claude", "min": {"5h": 5, "7d": 3}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}}
+    ],
+    "qa-escalate": [
+      {"name": "agy-opus",      "vendor": "anthropic", "cmd": "agy --model claude-opus-4-6-thinking", "pool": "antigravity:Claude and GPT", "min": {"*": 10}},
+      {"name": "claude-opus",   "vendor": "anthropic", "cmd": "claude --model opus",   "pool": "claude", "min": {"5h": 30, "7d": 15}},
+      {"name": "codex",         "vendor": "openai",    "cmd": "codex", "pool": "codex", "min": {"*": 10}}
+    ]
+  }
+}

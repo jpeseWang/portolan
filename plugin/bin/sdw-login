@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Exit: 0 ok, 1 login rejected or success marker not seen, 2 usage, 3 not onboarded,
+# 4 recipe, user, Keychain item or tool missing (oauth-manual always 4).
+set -u
+set -o pipefail
+here=$(cd "$(dirname "$0")" && pwd -P)
+me=sdw-login
+
+usage() {
+  cat <<'EOF'
+usage: sdw-login <role> [--app NAME]
+
+Logs in as <role> using the recipe in .sdw/run.md (## login, or ## login: NAME with --app)
+and the user from ## users. Role r-2 is the second user of role r. The password comes from
+Keychain service sdw:<PROJ_SLUG>:<role without -2>, account = user name.
+Kinds: form, api (cookie, or a token with '- token-path:'), header, oauth-manual.
+Writes under .sdw/auth/, mode 600: <role>.json (Playwright storage state) and <role>.cookies
+(curl jar) for cookie sessions; <role>.header ("Name: value", for curl -H @file and
+sdw-ui-shot --role) for token and header auth. Prints only "ok <role>".
+EOF
+}
+
+die() { echo "$me: $2" >&2; exit "$1"; }
+
+role="" app=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --app) [ $# -ge 2 ] || die 2 "--app needs a value"; app=$2; shift 2 ;;
+    -*) die 2 "unknown option $1" ;;
+    *) [ -z "$role" ] || die 2 "one role only"; role=$1; shift ;;
+  esac
+done
+[ -n "$role" ] || { usage >&2; exit 2; }
+printf '%s' "$role" | grep -Eq '^[a-z0-9-]+$' || die 2 "role must match [a-z0-9-]+"
+
+[ -x "$here/sdw-workdir" ] || die 4 "sdw-workdir missing beside $me"
+pd=$("$here/sdw-workdir" --projdir 2>/dev/null)
+[ $? -eq 0 ] && [ -n "$pd" ] || die 3 "not onboarded (run /sdw:onboard)"
+runmd="$pd/.sdw/run.md"
+[ -f "$runmd" ] || die 4 "missing $runmd"
+
+# run.md data: "## <section>[: <name>]" headings and "- <key>: <value>" lines; name "*" = first section of that kind.
+runmd_get() {
+  awk -v sec="$1" -v name="$2" -v key="$3" '
+    /^## / {
+      if (insec) exit
+      h = substr($0, 4); n = ""
+      i = index(h, ": "); if (i > 0) { n = substr(h, i + 2); h = substr(h, 1, i - 1) }
+      gsub(/^[ \t]+|[ \t]+$/, "", h); gsub(/^[ \t]+|[ \t]+$/, "", n)
+      insec = (h == sec && (name == "*" || n == name))
+      next
+    }
+    insec && /^- / {
+      line = substr($0, 3); i = index(line, ": "); if (i == 0) next
+      k = substr(line, 1, i - 1); v = substr(line, i + 2)
+      gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v)
+      if (k == key) { print v; exit }
+    }' "$runmd"
+}
+
+if [ -n "$app" ] && [ -n "$(runmd_get login "$app" kind)" ]; then lname=$app
+elif [ -n "$(runmd_get login "" kind)" ]; then lname=""
+else lname="*"; fi
+login_get() { runmd_get login "$lname" "$1"; }
+
+kind=$(login_get kind)
+[ -n "$kind" ] || die 4 "run.md has no ## login section with '- kind:'"
+case "$kind" in form|api|header|oauth-manual) ;; *) die 4 "unknown login kind '$kind' (form | api | header | oauth-manual)" ;; esac
+
+base_role=$role
+users=$(runmd_get users "" "$role")
+nth=1
+if [ -z "$users" ]; then
+  case "$role" in
+    *-2) base_role=${role%-2}; users=$(runmd_get users "" "$base_role"); nth=2 ;;
+  esac
+fi
+user=$(printf '%s\n' "$users" | awk -F',' -v n="$nth" '{ v = $n; gsub(/^[ \t]+|[ \t]+$/, "", v); print v }')
+[ -n "$user" ] || die 4 "run.md ## users has no user for role $role"
+
+abs_url() {
+  case "$1" in
+    /*)
+      port=""
+      [ -z "$app" ] || port=$(runmd_get app "$app" port)
+      [ -n "$port" ] || port=$(runmd_get app "*" port)
+      [ -n "$port" ] || die 4 "relative login url and no app port in run.md"
+      printf 'http://localhost:%s%s' "$port" "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+if [ "$kind" = "oauth-manual" ]; then
+  url=$(abs_url "$(login_get url)") || exit $?
+  echo "$me: $role logs in by hand; run: sdw-ui-shot --save-auth $role --url '$url' --headed" >&2
+  exit 4
+fi
+command -v python3 >/dev/null 2>&1 || die 4 "python3 not found"
+
+needs_secret=1
+if [ "$kind" = header ]; then
+  htpl=$(login_get header)
+  case "$htpl" in *:*) ;; *) die 4 "header login needs '- header: <Name>: <value with {user} or {pass}>' in run.md" ;; esac
+  case "$htpl" in *'{pass}'*) ;; *) needs_secret=0 ;; esac
+fi
+
+if [ "$needs_secret" = 1 ]; then
+  [ -x "$here/sdw-cfg" ] || die 4 "sdw-cfg missing beside $me"
+  slug=$("$here/sdw-cfg" PROJ_SLUG)
+  [ -n "$slug" ] || die 4 "PROJ_SLUG unknown"
+  svc="sdw:$slug:$base_role"
+  command -v security >/dev/null 2>&1 || die 4 "security (macOS Keychain) not found"
+  if ! security find-generic-password -s "$svc" -a "$user" >/dev/null 2>&1; then
+    die 4 "Keychain item missing; store it with: security add-generic-password -U -s '$svc' -a '$user' -w"
+  fi
+fi
+secret() { if [ "$needs_secret" = 1 ]; then security find-generic-password -s "$svc" -a "$user" -w; else printf '\n'; fi; }
+
+auth="$pd/.sdw/auth"
+umask 077
+mkdir -p "$auth" || die 4 "cannot create $auth"
+json="$auth/$role.json"
+jar="$auth/$role.cookies"
+hdr="$auth/$role.header"
+
+# Fill {user} (argv) and {pass} (stdin) into template argv 1; mode json escapes for a JSON body.
+fill() {
+  python3 -I -c '
+import json, sys
+tpl, user, mode = sys.argv[1:4]
+secret = sys.stdin.read().rstrip("\n")
+esc = (lambda v: json.dumps(v)[1:-1]) if mode == "json" else (lambda v: v.replace("\r", "").replace("\n", ""))
+sys.stdout.write(tpl.replace("{user}", esc(user)).replace("{pass}", esc(secret)) + ("" if mode == "json" else "\n"))
+' "$@"
+}
+
+convert() {
+  python3 -I -c '
+import json, sys
+mode, src, dst = sys.argv[1:4]
+if mode == "state2jar":
+    cookies = json.load(open(src)).get("cookies", [])
+    out = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        d = c["domain"]
+        e = c.get("expires") or -1
+        exp = int(e) if e > 0 else 0
+        out.append("\t".join([("#HttpOnly_" if c.get("httpOnly") else "") + d,
+            "TRUE" if d.startswith(".") else "FALSE", c.get("path", "/"),
+            "TRUE" if c.get("secure") else "FALSE", str(exp), c["name"], c["value"]]))
+    open(dst, "w").write("\n".join(out) + "\n")
+else:
+    cookies = []
+    for line in open(src):
+        line = line.rstrip("\n")
+        http_only = line.startswith("#HttpOnly_")
+        if http_only:
+            line = line[len("#HttpOnly_"):]
+        elif not line or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if len(f) != 7:
+            continue
+        cookies.append({"name": f[5], "value": f[6], "domain": f[0], "path": f[2],
+            "expires": int(f[4]) if f[4] != "0" else -1, "httpOnly": http_only,
+            "secure": f[3] == "TRUE", "sameSite": "Lax"})
+    json.dump({"cookies": cookies, "origins": []}, open(dst, "w"), indent=2)
+    sys.exit(0 if cookies else 1)
+' "$@"
+}
+
+case "$kind" in
+  form)
+    command -v node >/dev/null 2>&1 || die 4 "node >= 18 required on PATH"
+    url=$(abs_url "$(login_get url)") || exit $?
+    uf=$(login_get user-field) pf=$(login_get pass-field) sb=$(login_get submit) ok=$(login_get success)
+    [ -n "$url" ] && [ -n "$uf" ] && [ -n "$pf" ] && [ -n "$sb" ] && [ -n "$ok" ] \
+      || die 4 "form login needs url, user-field, pass-field, submit, success in run.md"
+    security find-generic-password -s "$svc" -a "$user" -w \
+      | node "$here/../libexec/login.mjs" --url "$url" --user-field "$uf" --pass-field "$pf" \
+          --submit "$sb" --success "$ok" --user "$user" --out "$json"
+    rc=$?
+    case $rc in
+      0) ;;
+      1|4) exit "$rc" ;;
+      *) die 4 "login helper failed ($rc)" ;;
+    esac
+    convert state2jar "$json" "$jar" || die 1 "cannot write cookie jar"
+    ;;
+  api)
+    api=$(login_get api) tpl=$(login_get api-body) tpath=$(login_get token-path) thdr=$(login_get token-header)
+    [ -n "$api" ] && [ -n "$tpl" ] || die 4 "api login needs '- api: <METHOD> <url>' and '- api-body:' in run.md"
+    method=${api%% *}
+    url=$(abs_url "${api#* }") || exit $?
+    command -v curl >/dev/null 2>&1 || die 4 "curl not found"
+    rm -f "$jar" "$hdr"
+    body="$auth/.$role.body"
+    code=$(secret | fill "$tpl" "$user" json \
+      | curl -sS -X "$method" -H 'Content-Type: application/json' --data-binary @- \
+          -c "$jar" -o "$body" -w '%{http_code}' --max-time 30 "$url")
+    case "$code" in
+      2??) ;;
+      000|"") rm -f "$body"; die 1 "login request failed (app not reachable?)" ;;
+      *) rm -f "$body"; die 1 "login rejected: HTTP $code" ;;
+    esac
+    if [ -n "$tpath" ]; then
+      python3 -I -c '
+import json, os, sys
+body, path, tpl, user, out = sys.argv[1:6]
+d = json.load(open(body))
+for k in path.strip(".").split("."):
+    d = d[int(k)] if isinstance(d, list) else d[k]
+if not isinstance(d, str) or not d:
+    sys.exit(1)
+clean = lambda v: v.replace("\r", "").replace("\n", "")
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, (tpl.replace("{user}", clean(user)).replace("{token}", clean(d)) + "\n").encode())
+os.close(fd)
+' "$body" "$tpath" "${thdr:-Authorization: Bearer {token}}" "$user" "$hdr" 2>/dev/null
+      rc=$?
+      rm -f "$body"
+      [ "$rc" = 0 ] || die 1 "login returned $code but no token at '$tpath'"
+      [ -s "$jar" ] && convert jar2state "$jar" "$json" >/dev/null 2>&1
+    else
+      rm -f "$body"
+      [ -f "$jar" ] || die 1 "login returned $code but set no cookie (token auth: add '- token-path:')"
+      convert jar2state "$jar" "$json" || die 1 "login returned $code but set no cookie (token auth: add '- token-path:')"
+    fi
+    ;;
+  header)
+    secret | fill "$htpl" "$user" header > "$hdr" || die 1 "cannot write $hdr"
+    ;;
+  *) die 4 "unknown login kind '$kind' (form | api | header | oauth-manual)" ;;
+esac
+
+for f in "$json" "$jar" "$hdr"; do [ -f "$f" ] && chmod 600 "$f"; done
+echo "ok $role"
