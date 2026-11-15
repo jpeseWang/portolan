@@ -12,6 +12,7 @@ config.env
 
 # Portolan route: this machine's settings and runtime state
 route/local.zsh
+route/routing.local.json
 route/projects/local/
 route/.master
 route/.dbpass
