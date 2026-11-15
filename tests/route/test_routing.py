@@ -226,5 +226,61 @@ class ClaudeKeychain(unittest.TestCase):
         self.assertEqual(providers.claude_keychain_services({}), ["Claude Code-credentials"])
 
 
+class LocalChains(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "routing.local.json")
+        self.old = os.environ.get("AIM_ROUTING_LOCAL")
+        os.environ["AIM_ROUTING_LOCAL"] = self.path
+
+    def tearDown(self):
+        shutil.rmtree(self.dir)
+        if self.old is None:
+            os.environ.pop("AIM_ROUTING_LOCAL", None)
+        else:
+            os.environ["AIM_ROUTING_LOCAL"] = self.old
+
+    def write(self, text):
+        with open(self.path, "w") as f:
+            f.write(text)
+
+    def test_no_local_file_means_the_shared_chains(self):
+        self.assertEqual(q.load_chains(), CHAINS)
+
+    def test_a_listed_role_replaces_the_shared_chain_and_others_stay(self):
+        codex = {"name": "codex", "vendor": "openai", "cmd": "codex", "pool": "codex", "min": {"*": 30}}
+        self.write(json.dumps({"chains": {"worker": [codex]}}))
+        got = q.load_chains()
+        self.assertEqual(got["worker"], [codex])
+        self.assertEqual(got["lead"], CHAINS["lead"])
+
+    def test_a_new_name_adds_a_role(self):
+        sonnet = {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude",
+                  "min": {"5h": 30, "7d": 25}}
+        self.write(json.dumps({"chains": {"auto-browser": [sonnet]}}))
+        got = q.load_chains()
+        self.assertIn("auto-browser", got)
+        self.assertEqual(set(CHAINS) - set(got), set())
+
+    def test_the_local_role_is_chosen_against_quota_like_any_other(self):
+        sonnet = {"name": "claude-sonnet", "vendor": "anthropic", "cmd": "claude --model sonnet", "pool": "claude",
+                  "min": {"5h": 30, "7d": 25}}
+        self.write(json.dumps({"chains": {"auto-browser": [sonnet]}}))
+        chain = q.load_chains()["auto-browser"]
+        low = {"claude": {"5h": 20, "7d": 90}}
+        _, chosen, _ = q.choose(chain, low, "/tmp", None)
+        self.assertIsNone(chosen)
+        ok = {"claude": {"5h": 60, "7d": 90}}
+        _, chosen, _ = q.choose(chain, ok, "/tmp", None)
+        self.assertEqual(chosen["name"], "claude-sonnet")
+
+    def test_an_unreadable_local_file_stops_instead_of_using_the_defaults(self):
+        for text in ("{not json", json.dumps({"chains": {"worker": []}}), json.dumps({"chains": {"worker": "codex"}}),
+                     json.dumps({"chains": ["worker"]})):
+            self.write(text)
+            with self.assertRaises(SystemExit):
+                q.load_chains()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

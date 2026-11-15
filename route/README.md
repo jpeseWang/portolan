@@ -61,6 +61,11 @@ QA roles never start with Opus. A plan that has only a 5-hour window (no weekly 
 Thresholds are defaults (Opus needs 30% of the 5-hour and 15% of the weekly window left, others 10%); edit them in
 `routing.json`. QA workflow, prompts and token-saving habits: [projects/qa.md](projects/qa.md).
 
+To change chains or thresholds on one machine only (for example a server that runs unattended jobs and should spend Codex
+and Gemini before Claude), put them in `route/routing.local.json` (not committed; `AIM_ROUTING_LOCAL` points elsewhere):
+`{"chains": {"auto-text": [ ...entries like those in routing.json... ]}}`. A role listed there replaces the shared chain,
+a new name adds a role. If the file cannot be read, the command stops instead of using the shared defaults.
+
 ```
 aim-pick                              # every chain and the current choice
 aim-pick qa-run --dir ~/work/app      # for a folder (matters when some tools are denied there)

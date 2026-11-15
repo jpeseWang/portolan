@@ -61,6 +61,24 @@ def age(ts):
 
 INTERVAL = 300      # min seconds between provider reads
 BACKOFF = 900       # after a rate_limited answer
+
+
+def load_chains():
+    """routing.json, then this machine's routing.local.json (or $AIM_ROUTING_LOCAL) on top: a role listed there replaces the
+    shared chain, a new name adds a role. A local file that cannot be read stops the command instead of falling back,
+    so an automation never starts on the shared defaults without anyone noticing."""
+    chains = json.load(open(os.path.join(HOME, "routing.json")))["chains"]
+    path = os.environ.get("AIM_ROUTING_LOCAL") or os.path.join(HOME, "routing.local.json")
+    try:
+        with open(path) as f:
+            local = json.load(f).get("chains", {})
+        if not isinstance(local, dict) or not all(isinstance(v, list) and v for v in local.values()):
+            raise ValueError("chains must map each role to a non-empty list")
+    except FileNotFoundError:
+        return chains
+    except (OSError, ValueError, AttributeError) as e:
+        sys.exit(f"routing.local.json ({path}) is not usable: {e}")
+    return {**chains, **local}
 CACHE = os.path.join(STATE, "subs-cache.json")
 
 
@@ -319,7 +337,7 @@ def choose(chain, pools, directory, exclude=None, environ=None, local_zsh=None):
 def pick_main(argv):
     def opt(name, default=None):
         return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
-    chains = json.load(open(os.path.join(HOME, "routing.json")))["chains"]
+    chains = load_chains()
     role = next((a for a in argv if a in chains), None)
     directory, exclude = opt("--dir", os.getcwd()), opt("--exclude")
     pools = quota_pools(read_subs())
@@ -346,7 +364,7 @@ def pick_main(argv):
 
 def main():
     if "--roles" in sys.argv:
-        for r in json.load(open(os.path.join(HOME, "routing.json")))["chains"]:
+        for r in load_chains():
             print(r)
         return
     if "--pick" in sys.argv:
